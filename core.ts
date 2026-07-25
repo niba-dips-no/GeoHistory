@@ -3,34 +3,29 @@ import type Database from 'better-sqlite3';
 // ===================== Public contract types =====================
 
 export type Precision = 'day' | 'month' | 'year' | 'decade' | 'century';
-export type Tier = 'local' | 'regional' | 'national';
+export type Scope = 'local' | 'regional' | 'national' | 'global';
 
 export interface PlaceInput {
   name: string;
   lat: number;
   lng: number;
-  level?: 'locality' | 'county' | 'admin1' | 'country'; // hint; used by the hierarchy matcher (v0.2)
+  level?: 'locality' | 'county' | 'admin1' | 'country';
 }
 
 export interface SegmentInput {
   label?: string;
   place: PlaceInput;
-  start: string;        // "1832" | "1871-10" | "1871-10-08" | "July 12, 1832"
-  end?: string;         // omit for a point-in-time life event
-  radiusKm?: number;    // per-segment override for the "local" radius
+  start: string;   // "1832" | "1871-10" | "1871-10-08" | "July 12, 1832"
+  end?: string;    // omit for a point-in-time life event
 }
 
 export interface EngineConfig {
+  significanceFloor: number; // events below this era-normalized importance are dropped
   maxPerSegment: number;
   maxSegments: number;
-  tiersKm: { local: number; regional: number; national: number };
 }
 
-export type TimelineConfigInput = {
-  maxPerSegment?: number;
-  maxSegments?: number;
-  tiersKm?: Partial<EngineConfig['tiersKm']>;
-};
+export type TimelineConfigInput = Partial<EngineConfig>;
 
 export interface TimelineInput {
   person?: string;
@@ -49,8 +44,9 @@ export interface TimelineEntry {
   lat: number;
   lng: number;
   distanceKm: number;
-  tier: Tier;
+  reachKm: number;
   scope: string | null;
+  significance: number;
   category: string | null;
   sourceUrl: string | null;
   segmentIndex: number;
@@ -58,7 +54,7 @@ export interface TimelineEntry {
 }
 
 export interface Timeline {
-  ingestVersion: string | null;
+  datasetVersion: string | null;
   person?: string;
   generatedWith: string;
   entries: TimelineEntry[];
@@ -66,9 +62,9 @@ export interface Timeline {
 }
 
 export const DEFAULT_CONFIG: EngineConfig = {
+  significanceFloor: 0.15,
   maxPerSegment: 12,
   maxSegments: 20,
-  tiersKm: { local: 50, regional: 300, national: 1500 },
 };
 
 // ===================== Date handling =====================
@@ -86,7 +82,6 @@ const MONTH_NAMES = ['', 'January', 'February', 'March', 'April', 'May', 'June',
 export function parseDate(raw: string): DateRange {
   const s = raw.trim();
 
-  // ISO-ish: 1871 | 1871-10 | 1871-10-08 | 1871-10-08T00:00:00Z
   const isoM = s.match(/^(\d{3,4})(?:-(\d{2}))?(?:-(\d{2}))?/);
   if (isoM && /^\d/.test(s)) {
     const year = parseInt(isoM[1], 10);
@@ -97,7 +92,6 @@ export function parseDate(raw: string): DateRange {
     return yearRange(year);
   }
 
-  // Human: "July 12, 1832" | "July 1832"
   const hM = s.match(/^([A-Za-z]+)\s+(?:(\d{1,2}),?\s+)?(\d{3,4})$/);
   if (hM) {
     const month = MONTHS[hM[1].toLowerCase()];
@@ -143,27 +137,18 @@ function haversineKm(aLat: number, aLng: number, bLat: number, bLng: number): nu
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
 }
 
-const TIER_RANK: Record<Tier, number> = { local: 0, regional: 1, national: 2 };
-
-function tierFor(distanceKm: number, localRadiusKm: number, cfg: EngineConfig): Tier | null {
-  if (distanceKm <= Math.max(localRadiusKm, cfg.tiersKm.local)) return 'local';
-  if (distanceKm <= cfg.tiersKm.regional) return 'regional';
-  if (distanceKm <= cfg.tiersKm.national) return 'national';
-  return null;
-}
-
-// ===================== Core query =====================
+// ===================== Core query (event-radius matching) =====================
 
 interface EventRow {
   id: string; title: string; blurb: string | null;
   date_start: string | null; date_end: string | null; date_precision: string | null;
   lat: number | null; lng: number | null;
-  scope: string | null; category: string | null; notability: number | null;
-  source_url: string | null; ingest_version: string | null;
+  reach_km: number | null; significance: number | null; scope: string | null;
+  category: string | null; source_url: string | null;
 }
 
 function normalizeEventDate(row: EventRow): DateRange {
-  const start = (row.date_start as string).slice(0, 10); // strip any time component
+  const start = (row.date_start as string).slice(0, 10);
   const s = parseDate(start);
   let precision: Precision = s.precision;
   if (row.date_precision && ['day', 'month', 'year', 'decade', 'century'].includes(row.date_precision)) {
@@ -173,64 +158,63 @@ function normalizeEventDate(row: EventRow): DateRange {
   return { loISO: s.loISO, hiISO, precision };
 }
 
-function scoreOf(tier: Tier, distanceKm: number, notability: number | null, cfg: EngineConfig): number {
-  const tierScore = 1 - TIER_RANK[tier] / 3;                       // local 1 · regional .67 · national .33
-  const proximity = 1 - Math.min(1, distanceKm / cfg.tiersKm.national);
-  const note = notability ?? 0;                                    // 0 until notability is ingested
-  return Math.round((0.5 * tierScore + 0.3 * note + 0.2 * proximity) * 1000) / 1000;
-}
-
-function rankCompare(a: TimelineEntry, b: TimelineEntry): number {
-  if (a.tier !== b.tier) return TIER_RANK[a.tier] - TIER_RANK[b.tier];  // scope proximity first
-  if (b.score !== a.score) return b.score - a.score;                    // score desc
-  if (a.dateStartISO !== b.dateStartISO) return a.dateStartISO < b.dateStartISO ? -1 : 1;
-  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;                        // deterministic tiebreak
-}
-
 export function getTimeline(db: Database.Database, input: TimelineInput): Timeline {
   const cfg: EngineConfig = {
+    significanceFloor: input.config?.significanceFloor ?? DEFAULT_CONFIG.significanceFloor,
     maxPerSegment: input.config?.maxPerSegment ?? DEFAULT_CONFIG.maxPerSegment,
     maxSegments: input.config?.maxSegments ?? DEFAULT_CONFIG.maxSegments,
-    tiersKm: { ...DEFAULT_CONFIG.tiersKm, ...(input.config?.tiersKm ?? {}) },
   };
 
   const segments = input.segments.slice(0, cfg.maxSegments);
+
+  // An event matches when the observer's coordinate falls inside the event's own
+  // reach box (cheap, portable spatial prefilter) -- exact haversine refines below.
   const stmt = db.prepare(`
-    SELECT id, title, blurb, date_start, date_end, date_precision,
-           lat, lng, scope, category, notability, source_url, ingest_version
+    SELECT id, title, blurb, date_start, date_end, date_precision, lat, lng,
+           reach_km, significance, scope, category, source_url
     FROM events
-    WHERE lat IS NOT NULL AND lng IS NOT NULL AND date_start IS NOT NULL
-      AND lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?
+    WHERE significance >= @floor
+      AND reach_km IS NOT NULL
+      AND reach_min_lat <= @lat AND reach_max_lat >= @lat
+      AND reach_min_lng <= @lng AND reach_max_lng >= @lng
+      AND substr(date_start, 1, 4) BETWEEN @loYear AND @hiYear
   `);
+
+  let datasetVersion: string | null = null;
+  try {
+    const r = db.prepare(`SELECT value FROM meta WHERE key = 'dataset_version'`).get() as { value?: string } | undefined;
+    datasetVersion = r?.value ?? null;
+  } catch { /* meta table may not exist on very old DBs */ }
 
   const seen = new Set<string>();
   const entries: TimelineEntry[] = [];
   let totalMatched = 0;
-  let ingestVersion: string | null = null;
 
   segments.forEach((seg, segmentIndex) => {
     const segLo = parseDate(seg.start).loISO;
     const segHi = (seg.end ? parseDate(seg.end) : parseDate(seg.start)).hiISO;
 
-    // Bounding box on the widest tier keeps the scan cheap as the dataset grows.
-    const dLat = cfg.tiersKm.national / 111;
-    const dLng = cfg.tiersKm.national / (111 * Math.max(0.2, Math.cos(seg.place.lat * Math.PI / 180)));
-    const rows = stmt.all(
-      seg.place.lat - dLat, seg.place.lat + dLat,
-      seg.place.lng - dLng, seg.place.lng + dLng,
-    ) as EventRow[];
+    const rows = stmt.all({
+      floor: cfg.significanceFloor,
+      lat: seg.place.lat,
+      lng: seg.place.lng,
+      loYear: segLo.slice(0, 4),
+      hiYear: segHi.slice(0, 4),
+    }) as EventRow[];
 
     const matches: TimelineEntry[] = [];
     for (const row of rows) {
-      if (row.lat == null || row.lng == null || !row.date_start) continue;
-      ingestVersion ??= row.ingest_version;
+      if (row.lat == null || row.lng == null || !row.date_start || row.reach_km == null) continue;
 
       const ev = normalizeEventDate(row);
       if (!rangesOverlap(ev.loISO, ev.hiISO, segLo, segHi)) continue;
 
       const distanceKm = haversineKm(seg.place.lat, seg.place.lng, row.lat, row.lng);
-      const tier = tierFor(distanceKm, seg.radiusKm ?? cfg.tiersKm.local, cfg);
-      if (!tier) continue;
+      if (distanceKm > row.reach_km) continue; // exact reach-circle test
+
+      const significance = typeof row.significance === 'number' ? row.significance : 0;
+      const headroom = 1 - Math.min(1, distanceKm / row.reach_km); // 1 at the event, 0 at the edge
+      const score = Math.round(significance * (0.6 + 0.4 * headroom) * 1000) / 1000;
 
       totalMatched++;
       matches.push({
@@ -239,45 +223,49 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
         dateStartISO: ev.loISO, dateEndISO: ev.hiISO, precision: ev.precision,
         lat: row.lat, lng: row.lng,
         distanceKm: Math.round(distanceKm * 10) / 10,
-        tier, scope: row.scope, category: row.category, sourceUrl: row.source_url,
-        segmentIndex, score: scoreOf(tier, distanceKm, row.notability, cfg),
+        reachKm: row.reach_km,
+        scope: row.scope, significance, category: row.category, sourceUrl: row.source_url,
+        segmentIndex, score,
       });
     }
 
-    matches.sort(rankCompare);
+    matches.sort((a, b) =>
+      b.score !== a.score ? b.score - a.score :
+      a.dateStartISO !== b.dateStartISO ? (a.dateStartISO < b.dateStartISO ? -1 : 1) :
+      a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+
     let kept = 0;
     for (const m of matches) {
-      if (seen.has(m.id)) continue;          // an event appears once, under its best segment
+      if (seen.has(m.id)) continue; // an event appears once, under its best-scoring segment
       seen.add(m.id);
       entries.push(m);
       if (++kept >= cfg.maxPerSegment) break;
     }
   });
 
-  // Merge all segments into one chronological timeline.
   entries.sort((a, b) =>
     a.dateStartISO < b.dateStartISO ? -1 :
     a.dateStartISO > b.dateStartISO ? 1 :
     a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
   return {
-    ingestVersion,
+    datasetVersion,
     person: input.person,
-    generatedWith: 'geohistory-core@0.1.0',
+    generatedWith: 'geohistory-core@0.4.0',
     entries,
     meta: { segmentCount: segments.length, totalMatched, returned: entries.length },
   };
 }
 
-// ===================== Renderers =====================
+// ===================== Renderer =====================
 
 export function renderMarkdown(t: Timeline): string {
   const out: string[] = [`# Timeline${t.person ? ` \u2014 ${t.person}` : ''}`, ''];
   for (const e of t.entries) {
     out.push(`- **${e.date}** \u2014 ${e.title}`);
     if (e.blurb) out.push(`  ${e.blurb}`);
-    out.push(`  _${e.distanceKm} km \u00b7 ${e.tier}_${e.sourceUrl ? ` \u00b7 [source](${e.sourceUrl})` : ''}`);
+    out.push(`  _${e.scope ?? 'n/a'} \u00b7 sig ${e.significance} \u00b7 ${e.distanceKm}/${e.reachKm} km${e.sourceUrl ? ` \u00b7 [source](${e.sourceUrl})` : ''}_`);
   }
-  out.push('', `_Dataset ${t.ingestVersion ?? 'unknown'} \u00b7 ${t.meta.returned} of ${t.meta.totalMatched} matched events_`);
+  out.push('', `_Dataset ${t.datasetVersion ?? 'unknown'} \u00b7 ${t.meta.returned} of ${t.meta.totalMatched} matched events_`);
   return out.join('\n');
 }

@@ -20,20 +20,34 @@ CREATE TABLE IF NOT EXISTS events (
   lat            REAL,
   lng            REAL,
   place_id       TEXT REFERENCES places(id),
-  scope          TEXT CHECK (scope IN ('local','regional','national','global')),
+  scope          TEXT CHECK (scope IN ('local','regional','national','global')),  -- geographic reach class
   category       TEXT,                      -- event | conflict | election | founding | discovery | birth | death
-  notability     REAL,                      -- 0..1 (normalized Wikidata sitelink count)
+  notability     REAL,                      -- absolute fame proxy: normalized Wikidata sitelinks (0..1)
+  significance   REAL,                      -- era-normalized importance (0..1); drives the floor + ranking
+  reach_km       REAL,                      -- materialized relevance radius (derived from scope + significance)
+  reach_min_lat  REAL,                      -- reach bounding box (portable spatial prefilter for the engine)
+  reach_max_lat  REAL,
+  reach_min_lng  REAL,
+  reach_max_lng  REAL,
   source_url     TEXT,
   source_ids     TEXT,                      -- JSON provenance: {"wikidata":"Q..."}
   ingest_version TEXT NOT NULL
 );
 
--- Indexes the timeline engine + search rely on
-CREATE INDEX IF NOT EXISTS idx_events_lat_lng    ON events(lat, lng);
-CREATE INDEX IF NOT EXISTS idx_events_date_start ON events(date_start);
-CREATE INDEX IF NOT EXISTS idx_events_place      ON events(place_id);
-CREATE INDEX IF NOT EXISTS idx_events_category   ON events(category);
-CREATE INDEX IF NOT EXISTS idx_places_parent     ON places(parent_id);
+-- Build provenance / reproducibility (dataset version, scorer + reach formula versions, timestamps)
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT
+);
+
+-- Indexes the ingest, scorer, search, and timeline engine rely on
+CREATE INDEX IF NOT EXISTS idx_events_lat_lng      ON events(lat, lng);
+CREATE INDEX IF NOT EXISTS idx_events_date_start   ON events(date_start);
+CREATE INDEX IF NOT EXISTS idx_events_place        ON events(place_id);
+CREATE INDEX IF NOT EXISTS idx_events_category     ON events(category);
+CREATE INDEX IF NOT EXISTS idx_events_significance ON events(significance);
+CREATE INDEX IF NOT EXISTS idx_events_reach_box    ON events(reach_min_lat, reach_max_lat, reach_min_lng, reach_max_lng);
+CREATE INDEX IF NOT EXISTS idx_places_parent       ON places(parent_id);
 
 -- Full-text search over title + blurb (external-content FTS5; rebuilt after ingest).
 CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
