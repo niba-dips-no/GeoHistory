@@ -1,4 +1,7 @@
 import Database from 'better-sqlite3';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
 // Minimal shape of the Wikidata SPARQL JSON response we consume.
 interface SparqlBinding {
@@ -17,40 +20,13 @@ const db = new Database('events.sqlite');
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
-// 2. Set up Schema (mirrors schema.sql)
-db.exec(`
-  CREATE TABLE IF NOT EXISTS places (
-    id TEXT PRIMARY KEY,
-    name TEXT,
-    level TEXT,
-    parent_id TEXT,
-    lat REAL,
-    lng REAL,
-    aliases TEXT,
-    FOREIGN KEY(parent_id) REFERENCES places(id)
-  );
+// 2. Set up schema from the canonical schema.sql (single source of truth).
+// Resolve the path relative to this file so it works no matter the CWD.
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8');
+db.exec(schema);
 
-  CREATE TABLE IF NOT EXISTS events (
-    id TEXT PRIMARY KEY,
-    title TEXT,
-    blurb TEXT,
-    date_start TEXT,
-    date_end TEXT,
-    date_precision TEXT,
-    lat REAL,
-    lng REAL,
-    place_id TEXT,
-    scope TEXT,
-    category TEXT,
-    notability REAL,
-    source_url TEXT,
-    source_ids TEXT,
-    ingest_version TEXT,
-    FOREIGN KEY(place_id) REFERENCES places(id)
-  );
-`);
-
-console.log("\u2705 Database schema initialized.");
+console.log("\u2705 Database schema initialized (from schema.sql).");
 
 // 3. Wikidata SPARQL Query (Proof of Concept)
 // Fetches events (Q1190554 or subclasses) that have a point in time (P585)
