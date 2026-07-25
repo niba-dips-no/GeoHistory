@@ -132,7 +132,7 @@ function ingestRows(h: Harvester, rows: Row[]): number {
         lng: pt.lng,
         category: h.category,
         notability: Math.round(Math.min(1, sitelinks / 100) * 1000) / 1000,
-        source_url: b.article?.value ?? `https://www.wikidata.org/wiki/${qid}`,
+        source_url: b.article?.value ?? b.item.value,
         source_ids: JSON.stringify({ wikidata: qid }),
         ingest_version: INGEST_VERSION,
       });
