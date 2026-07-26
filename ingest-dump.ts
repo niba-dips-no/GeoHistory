@@ -120,10 +120,12 @@ function parseTimeClaim(e: any, props: string[]): ParsedDate | null {
   return null;
 }
 
+const WIKI_BASE = 'https://en.wikipedia.org/wiki/';
+const ENTITY_BASE = 'http://www.wikidata.org/entity/';
 function sourceUrl(e: any): string {
   const title = e.sitelinks?.enwiki?.title;
-  if (title) return `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, '_'))}`;
-  return `http://www.wikidata.org/entity/${e.id}`;
+  if (title) return WIKI_BASE + encodeURIComponent(String(title).split(' ').join('_'));
+  return ENTITY_BASE + e.id;
 }
 
 // ===================== PASS 1: coords + subclass edges =====================
