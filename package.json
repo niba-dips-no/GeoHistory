@@ -1,12 +1,13 @@
 {
   "name": "geohistory",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Open geo-located historical events dataset and deterministic timeline protocol.",
   "license": "MIT",
   "author": "Ben Noffsinger",
   "type": "module",
   "scripts": {
     "ingest": "tsx ingest.ts",
+    "ingest:dump": "tsx ingest-dump.ts",
     "score": "tsx score.ts",
     "timeline": "tsx timeline.ts",
     "search": "tsx search.ts"
