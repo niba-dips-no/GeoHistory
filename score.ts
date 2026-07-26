@@ -9,7 +9,7 @@ import Database from 'better-sqlite3';
 //   npm run score reach      -> pass 2 only (reach_km + bbox) -- the cheap no-LLM patch
 
 const MODE = (process.argv[2] ?? 'all').toLowerCase(); // 'all' | 'scores' | 'reach'
-const SCORING_VERSION = 'struct-v0.1';
+const SCORING_VERSION = 'struct-v0.2';
 const REACH_VERSION = 'reach-v0.1';
 
 const db = new Database('events.sqlite');
@@ -36,15 +36,18 @@ function setMeta(key: string, value: string): void {
 }
 
 // ---------- pass 1: scope + significance ----------
-// Scope (geographic reach class) from category + absolute fame. This is the
-// structural baseline; the LLM refiner will later overwrite these labels semantically.
+// Scope (geographic reach class) from category + absolute fame. Thresholds are
+// tuned so world-shaping conflicts/events/discoveries become GLOBAL and reach
+// everyone alive at the time (a WWII battle is context for a Chicagoan, not just
+// for people near the battlefield). This is the structural baseline; the LLM
+// refiner will later overwrite these labels semantically.
 function scopeFor(category: string | null, notability: number): Scope {
   switch (category) {
     case 'election':  return notability >= 0.5 ? 'national' : 'regional';
-    case 'conflict':  return notability >= 0.7 ? 'national' : notability >= 0.3 ? 'regional' : 'local';
-    case 'founding':  return notability >= 0.6 ? 'national' : 'local';
-    case 'discovery': return notability >= 0.5 ? 'global' : 'national';
-    case 'event':     return notability >= 0.8 ? 'global' : notability >= 0.5 ? 'national' : notability >= 0.25 ? 'regional' : 'local';
+    case 'conflict':  return notability >= 0.6 ? 'global' : notability >= 0.3 ? 'national' : notability >= 0.15 ? 'regional' : 'local';
+    case 'founding':  return notability >= 0.75 ? 'national' : notability >= 0.4 ? 'regional' : 'local';
+    case 'discovery': return notability >= 0.4 ? 'global' : 'national';
+    case 'event':     return notability >= 0.6 ? 'global' : notability >= 0.35 ? 'national' : notability >= 0.2 ? 'regional' : 'local';
     case 'birth':
     case 'death':     return 'local'; // a person's birth/death reaches locally; their fame lives in significance
     default:          return notability >= 0.6 ? 'national' : 'local';

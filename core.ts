@@ -20,9 +20,11 @@ export interface SegmentInput {
 }
 
 export interface EngineConfig {
-  significanceFloor: number; // events below this era-normalized importance are dropped
-  maxPerSegment: number;
+  significanceFloor: number;             // events below this era-normalized importance are dropped
+  maxPerSegment: number;                 // hard cap on entries contributed per life segment
   maxSegments: number;
+  scopeQuota: Record<Scope, number>;     // per-segment cap PER scope tier (the flood control)
+  categoryWeights: Record<string, number>; // rank multipliers; unspecified categories default to 1
 }
 
 export type TimelineConfigInput = Partial<EngineConfig>;
@@ -61,10 +63,16 @@ export interface Timeline {
   meta: { segmentCount: number; totalMatched: number; returned: number };
 }
 
+// Ambient-history defaults. A person's birth/death is weighted DOWN because a
+// celebrity's fame is not the same as that birth being significant local history
+// at the time. Per-scope quotas guarantee a blend (local color + world context)
+// rather than letting one tier -- births or battles -- monopolize the slots.
 export const DEFAULT_CONFIG: EngineConfig = {
   significanceFloor: 0.15,
   maxPerSegment: 12,
   maxSegments: 20,
+  scopeQuota: { local: 4, regional: 3, national: 4, global: 5 },
+  categoryWeights: { birth: 0.4, death: 0.5 },
 };
 
 // ===================== Date handling =====================
@@ -163,6 +171,8 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
     significanceFloor: input.config?.significanceFloor ?? DEFAULT_CONFIG.significanceFloor,
     maxPerSegment: input.config?.maxPerSegment ?? DEFAULT_CONFIG.maxPerSegment,
     maxSegments: input.config?.maxSegments ?? DEFAULT_CONFIG.maxSegments,
+    scopeQuota: { ...DEFAULT_CONFIG.scopeQuota, ...(input.config?.scopeQuota ?? {}) },
+    categoryWeights: { ...DEFAULT_CONFIG.categoryWeights, ...(input.config?.categoryWeights ?? {}) },
   };
 
   const segments = input.segments.slice(0, cfg.maxSegments);
@@ -213,8 +223,9 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
       if (distanceKm > row.reach_km) continue; // exact reach-circle test
 
       const significance = typeof row.significance === 'number' ? row.significance : 0;
+      const weight = cfg.categoryWeights[row.category ?? ''] ?? 1; // demote births/deaths vs substantive history
       const headroom = 1 - Math.min(1, distanceKm / row.reach_km); // 1 at the event, 0 at the edge
-      const score = Math.round(significance * (0.6 + 0.4 * headroom) * 1000) / 1000;
+      const score = Math.round(significance * weight * (0.6 + 0.4 * headroom) * 1000) / 1000;
 
       totalMatched++;
       matches.push({
@@ -234,11 +245,18 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
       a.dateStartISO !== b.dateStartISO ? (a.dateStartISO < b.dateStartISO ? -1 : 1) :
       a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
+    // Fill per-scope quotas from the top-scoring matches so the segment gets a
+    // BLEND across tiers instead of one tier (births, or battles) taking every slot.
+    const perScope: Record<Scope, number> = { local: 0, regional: 0, national: 0, global: 0 };
     let kept = 0;
     for (const m of matches) {
       if (seen.has(m.id)) continue; // an event appears once, under its best-scoring segment
+      const sc = (m.scope ?? 'local') as Scope;
+      const quota = cfg.scopeQuota[sc] ?? cfg.maxPerSegment;
+      if (perScope[sc] >= quota) continue;
       seen.add(m.id);
       entries.push(m);
+      perScope[sc]++;
       if (++kept >= cfg.maxPerSegment) break;
     }
   });
@@ -251,7 +269,7 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
   return {
     datasetVersion,
     person: input.person,
-    generatedWith: 'geohistory-core@0.4.0',
+    generatedWith: 'geohistory-core@0.4.1',
     entries,
     meta: { segmentCount: segments.length, totalMatched, returned: entries.length },
   };
