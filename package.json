@@ -1,6 +1,6 @@
 {
   "name": "geohistory",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Open geo-located historical events dataset and deterministic timeline protocol.",
   "license": "MIT",
   "author": "Ben Noffsinger",
@@ -11,7 +11,8 @@
     "score": "tsx score.ts",
     "timeline": "tsx timeline.ts",
     "search": "tsx search.ts",
-    "stats": "tsx stats.ts"
+    "stats": "tsx stats.ts",
+    "serve": "tsx server.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.0.0"
