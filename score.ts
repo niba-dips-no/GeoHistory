@@ -9,7 +9,7 @@ import Database from 'better-sqlite3';
 //   npm run score reach      -> pass 2 only (reach_km + bbox) -- the cheap no-LLM patch
 
 const MODE = (process.argv[2] ?? 'all').toLowerCase(); // 'all' | 'scores' | 'reach'
-const SCORING_VERSION = 'struct-v0.2';
+const SCORING_VERSION = 'struct-v0.3';
 const REACH_VERSION = 'reach-v0.1';
 
 const db = new Database('events.sqlite');
@@ -47,7 +47,9 @@ function scopeFor(category: string | null, notability: number): Scope {
     case 'conflict':  return notability >= 0.6 ? 'global' : notability >= 0.3 ? 'national' : notability >= 0.15 ? 'regional' : 'local';
     case 'founding':  return notability >= 0.75 ? 'national' : notability >= 0.4 ? 'regional' : 'local';
     case 'discovery': return notability >= 0.4 ? 'global' : 'national';
-    case 'milestone': return notability >= 0.5 ? 'global' : 'national'; // space/first-of-its-kind: globally felt when famous
+    // milestone (inventions / first-of-its-kind): full 4-tier ladder so minor
+    // novelties stay local while world-changing firsts reach everyone.
+    case 'milestone': return notability >= 0.75 ? 'global' : notability >= 0.45 ? 'national' : notability >= 0.25 ? 'regional' : 'local';
     case 'treaty':    return notability >= 0.6 ? 'global' : notability >= 0.3 ? 'national' : 'regional';
     case 'event':     return notability >= 0.6 ? 'global' : notability >= 0.35 ? 'national' : notability >= 0.2 ? 'regional' : 'local';
     case 'birth':
@@ -56,10 +58,10 @@ function scopeFor(category: string | null, notability: number): Scope {
   }
 }
 
-interface ScoreRow { id: string; category: string | null; notability: number | null; date_start: string | null; }
+interface ScoreRow { id: string; category: string | null; notability: number | null; date_start: string | null; scope: string | null; ingest_version: string | null; }
 
 function runScoring(): void {
-  const rows = db.prepare(`SELECT id, category, notability, date_start FROM events`).all() as ScoreRow[];
+  const rows = db.prepare(`SELECT id, category, notability, date_start, scope, ingest_version FROM events`).all() as ScoreRow[];
 
   // Era-normalize: significance = percentile of notability WITHIN the event's decade.
   // This is what keeps sparse historical decades from being buried under modern volume.
@@ -89,13 +91,17 @@ function runScoring(): void {
     for (const r of items) {
       const notability = typeof r.notability === 'number' ? r.notability : 0;
       const significance = Math.round(percentile(decadeOf(r.date_start), notability) * 1000) / 1000;
-      upd.run({ id: r.id, scope: scopeFor(r.category, notability), significance });
+      // Curated seed rows carry an authored scope; preserve it rather than deriving
+      // one from the structural formula, so hand-tuned relevance tiers survive scoring.
+      const isSeed = typeof r.ingest_version === 'string' && r.ingest_version.startsWith('seed-');
+      const scope = (isSeed && r.scope) ? r.scope : scopeFor(r.category, notability);
+      upd.run({ id: r.id, scope, significance });
     }
   });
   tx(rows);
   setMeta('scoring_version', SCORING_VERSION);
   setMeta('scored_at', new Date().toISOString());
-  console.log(`Pass 1: scored ${rows.length} events (scope + era-normalized significance).`);
+  console.log(`Pass 1: scored ${rows.length} events (scope + era-normalized significance; authored scope preserved for seed rows).`);
 }
 
 // ---------- pass 2: reach_km + bounding box (pure formula; the cheap patch) ----------
