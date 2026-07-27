@@ -47,6 +47,8 @@ function scopeFor(category: string | null, notability: number): Scope {
     case 'conflict':  return notability >= 0.6 ? 'global' : notability >= 0.3 ? 'national' : notability >= 0.15 ? 'regional' : 'local';
     case 'founding':  return notability >= 0.75 ? 'national' : notability >= 0.4 ? 'regional' : 'local';
     case 'discovery': return notability >= 0.4 ? 'global' : 'national';
+    case 'milestone': return notability >= 0.5 ? 'global' : 'national'; // space/first-of-its-kind: globally felt when famous
+    case 'treaty':    return notability >= 0.6 ? 'global' : notability >= 0.3 ? 'national' : 'regional';
     case 'event':     return notability >= 0.6 ? 'global' : notability >= 0.35 ? 'national' : notability >= 0.2 ? 'regional' : 'local';
     case 'birth':
     case 'death':     return 'local'; // a person's birth/death reaches locally; their fame lives in significance

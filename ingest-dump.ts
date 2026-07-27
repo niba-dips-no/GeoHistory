@@ -6,22 +6,24 @@ import { dirname, join } from 'node:path';
 import { readFileSync } from 'node:fs';
 import Database from 'better-sqlite3';
 
-// ===================== Comprehensive dump ingester (v0.5) =====================
+// ===================== Comprehensive dump ingester (v0.6) =====================
 // Harvests the full geo-located event dataset from a LOCAL Wikidata JSON dump
 // (no live SPARQL -> no rate limits, fully reproducible). Two streaming passes:
 //
-//   Pass 1 (coords): index every entity's coordinates (P625) + subclass edges (P279)
+//   Pass 1 (coords): index every entity coordinate (P625) + subclass edges (P279)
 //   -> closure step expands category root types into their full descendant sets
 //   Pass 2 (events): classify + extract each event WITH true Wikidata date precision
 //
 // Download the dump first (~90-140 GB gzip):
 //   https://dumps.wikimedia.org/wikidatawiki/entities/latest-all.json.gz
 //
-// Usage (PowerShell):
-//   $env:WIKIDATA_DUMP="D:\\wikidata\\latest-all.json.gz"; npm run ingest:dump
-//   # validate on a slice first:
-//   $env:WIKIDATA_DUMP="..."; $env:INGEST_MAX_LINES=2000000; npm run ingest:dump
-//   then: npm run score  &&  npm run timeline
+// Usage (PowerShell): point WIKIDATA_DUMP at the dump (e.g. the relative
+// latest-all.json.gz sitting in the repo folder), then: npm run ingest:dump
+// Validate on a slice first via INGEST_MAX_LINES, then: npm run score && npm run timeline
+//
+// v0.6 adds a milestone category (spaceflight, Moon landing, ...) plus a
+// country-centroid coordinate fallback so globally-significant events that lack
+// their own P625 (or carry an off-Earth one) are still placed and reach everyone.
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -30,7 +32,7 @@ const START_YEAR = parseInt(process.env.INGEST_START_YEAR ?? '1275', 10); // ~75
 const END_YEAR = parseInt(process.env.INGEST_END_YEAR ?? String(new Date().getUTCFullYear()), 10);
 const MAX_LINES = process.env.INGEST_MAX_LINES ? parseInt(process.env.INGEST_MAX_LINES, 10) : 0; // 0 = no limit
 const PASS = (process.env.INGEST_PASS ?? 'all').toLowerCase(); // 'coords' | 'events' | 'all'
-const INGEST_VERSION = 'dump-v0.5';
+const INGEST_VERSION = 'dump-v0.6';
 
 if (!DUMP || !fs.existsSync(DUMP)) {
   console.error('Set WIKIDATA_DUMP to a local latest-all.json.gz path. Download: https://dumps.wikimedia.org/wikidatawiki/entities/latest-all.json.gz');
@@ -49,12 +51,19 @@ db.exec(`CREATE TABLE IF NOT EXISTS _subclass (child TEXT, parent TEXT);`);
 db.exec(`CREATE INDEX IF NOT EXISTS idx_subclass_parent ON _subclass(parent);`);
 
 // ---------- category definitions (root types + which date props carry the event date) ----------
-interface CategoryDef { category: string; roots: string[]; dateProps: string[]; floor: number; }
+// coordMode controls how an event is placed:
+//   'p625'              -> require the event's own P625 coordinate (default; unchanged)
+//   'p625_then_country' -> prefer own P625, else the country (P17/P495) centroid
+//   'country_first'     -> prefer the country centroid (safer for off-Earth coords), else P625
+type CoordMode = 'p625' | 'p625_then_country' | 'country_first';
+interface CategoryDef { category: string; roots: string[]; dateProps: string[]; floor: number; coordMode?: CoordMode; }
 const CATEGORIES: CategoryDef[] = [
   { category: 'conflict',  roots: ['Q180684', 'Q198', 'Q178561', 'Q831663'], dateProps: ['P585', 'P580'], floor: 5 },
-  { category: 'election',  roots: ['Q40231'],                                 dateProps: ['P585', 'P580'], floor: 3 },
+  { category: 'election',  roots: ['Q40231'],                                 dateProps: ['P585', 'P580'], floor: 12, coordMode: 'p625_then_country' },
+  { category: 'treaty',    roots: ['Q131569'],                                dateProps: ['P585', 'P580'], floor: 10, coordMode: 'p625_then_country' },
   { category: 'founding',  roots: ['Q6256', 'Q3624078', 'Q515', 'Q3957', 'Q532', 'Q10864048', 'Q1549591'], dateProps: ['P571'], floor: 5 },
   { category: 'discovery', roots: ['Q12772819', 'Q11019'],                    dateProps: ['P575', 'P571'], floor: 3 },
+  { category: 'milestone', roots: ['Q5916', 'Q495307'],                       dateProps: ['P585', 'P580', 'P575', 'P571'], floor: 25, coordMode: 'country_first' },
   { category: 'event',     roots: ['Q1190554', 'Q1656682'],                   dateProps: ['P585', 'P580'], floor: 8 },
 ];
 const HUMAN_FLOOR = 30; // sitelink floor for births/deaths (keeps the file to notable people)
@@ -180,6 +189,22 @@ function runEventsPass(typeToCategory: Map<string, string>): Promise<void> {
   console.log('Pass 2: extracting events with date precision...');
   const catByName = new Map(CATEGORIES.map((c) => [c.category, c]));
   const getCoord = db.prepare('SELECT lat, lng FROM _coords WHERE qid = ?');
+
+  // Country-centroid fallback: reuse the P625 we already indexed for the country
+  // entity itself (countries carry a representative coordinate in _coords).
+  const countryCoord = (e: any): { lat: number; lng: number } | null => {
+    for (const prop of ['P17', 'P495']) { // country, country of origin
+      const cid = firstItemId(e, prop);
+      if (cid) { const co = getCoord.get(cid) as any; if (co) return { lat: co.lat, lng: co.lng }; }
+    }
+    return null;
+  };
+  const resolveCoord = (e: any, mode: CoordMode): { lat: number; lng: number } | null => {
+    if (mode === 'country_first') return countryCoord(e) ?? firstCoordinate(e);
+    if (mode === 'p625_then_country') return firstCoordinate(e) ?? countryCoord(e);
+    return firstCoordinate(e);
+  };
+
   const insEvent = db.prepare(`
     INSERT OR IGNORE INTO events
       (id, title, blurb, date_start, date_precision, lat, lng, category, notability, source_url, source_ids, ingest_version)
@@ -223,14 +248,14 @@ function runEventsPass(typeToCategory: Map<string, string>): Promise<void> {
       return;
     }
 
-    // --- typed events (conflict/election/founding/discovery/event) ---
+    // --- typed events (conflict/election/treaty/founding/discovery/milestone/event) ---
     let category: string | null = null;
     for (const t of types) { const c = typeToCategory.get(t); if (c) { category = c; break; } }
     if (!category) return;
     const def = catByName.get(category)!;
     if (sl < def.floor) return;
 
-    const coord = firstCoordinate(e);
+    const coord = resolveCoord(e, def.coordMode ?? 'p625');
     if (!coord) return; // event must be placeable
     const date = parseTimeClaim(e, def.dateProps);
     if (!date || !inWindow(date.year)) return;
