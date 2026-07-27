@@ -2,7 +2,7 @@
 
 *An open, geo-located historical events dataset and a deterministic timeline protocol. Give it a person's places and dates; get back a sourced timeline of the history that surrounded their life.*
 
-**Status:** v0.5 - comprehensive dump-based ingest + scored dataset + event-radius engine
+**Status:** v0.6 - comprehensive dataset (105k events) + event-radius engine + JSON API
 
 ## Overview
 
@@ -23,7 +23,7 @@ Every event is scored on two independent axes so the timeline is both *placed* a
 ## Pipeline
 
 ```
-ingest (sample)  OR  ingest:dump (comprehensive)   ->   score   ->   timeline / search
+ingest (sample)  OR  ingest:dump (comprehensive)   ->   score   ->   timeline / search / serve
 ```
 
 1. **Harvest** - two options:
@@ -42,14 +42,48 @@ ingest (sample)  OR  ingest:dump (comprehensive)   ->   score   ->   timeline / 
    npm run score
    npm run timeline
    ```
-3. **Validate on a slice first** (stops after N lines):
+3. **Validate on a slice first** (stops after N lines), then start from an empty DB for the full run:
    ```powershell
+   Remove-Item events.sqlite, events.sqlite-wal, events.sqlite-shm -ErrorAction SilentlyContinue
    $env:WIKIDATA_DUMP="D:\wikidata\latest-all.json.gz"; $env:INGEST_MAX_LINES=2000000; npm run ingest:dump
    ```
 
 How it works: **Pass 1** indexes every entity's coordinates (`P625`) and subclass edges (`P279`); a **closure step** expands each category's root types into their descendants via a recursive query; **Pass 2** classifies and extracts each event, resolving a person's birthplace to coordinates via the pass-1 index, and capturing each date at its real Wikidata precision (year / month / day / decade / century).
 
 Env knobs: `WIKIDATA_DUMP` (required), `INGEST_START_YEAR` (default 1275), `INGEST_END_YEAR` (default current year), `INGEST_MAX_LINES` (0 = all), `INGEST_PASS` (`coords` | `events` | `all`).
+
+### Inspecting a build
+
+`npm run stats` prints a read-only composition report - total count, breakdown by category / date precision / scope, year span, sample year-precision events, and the `meta` provenance rows. Use it to sanity-check a build before shipping it.
+
+## API service
+
+A thin, dependency-free HTTP server (Node's built-in `http`, no extra packages) that serves the timeline engine and full-text search over the local `events.sqlite`. All access is read-only, so the same static file can back this server or an in-browser applet.
+
+```powershell
+npm run serve            # http://localhost:8787  (override with PORT)
+```
+
+| Method / path | Purpose |
+| --- | --- |
+| `GET /` | self-documenting: service info + an example request body |
+| `GET /health` | liveness check |
+| `GET /meta` | dataset provenance (version, window) + event count |
+| `GET /search?q=<term>&limit=<n>` | full-text search (default 25, max 100) |
+| `POST /timeline` | body = `TimelineInput` JSON -> `Timeline` JSON; add `?format=markdown` for Markdown |
+
+`POST /timeline` takes a person's life segments and returns the ranked, cited timeline:
+
+```json
+{
+  "person": "Ada Example",
+  "segments": [
+    { "label": "Childhood", "place": { "name": "Chicago", "lat": 41.8819, "lng": -87.6278 }, "start": "1939", "end": "1945" }
+  ]
+}
+```
+
+The response is the exact `Timeline` object `getTimeline()` returns (`entries` + `meta` + `datasetVersion`). Invalid input (missing segments, non-numeric coordinates, unparseable dates) returns a `400` with a specific message. CORS is open so a browser applet can call it directly.
 
 ## Repo layout
 
@@ -62,6 +96,8 @@ Env knobs: `WIKIDATA_DUMP` (required), `INGEST_START_YEAR` (default 1275), `INGE
 | `core.ts` | Deterministic event-radius timeline engine (`getTimeline`) - importable, no side effects |
 | `timeline.ts` | CLI demo: runs `getTimeline` against `events.sqlite` |
 | `search.ts` | CLI full-text search over the dataset (`events_fts`) |
+| `stats.ts` | Read-only dataset diagnostics (counts by category / precision / scope + provenance) |
+| `server.ts` | JSON API wrapping `getTimeline` + search over `events.sqlite` (`npm run serve`) |
 
 `events.sqlite` is a build artifact (gitignored) and will be published via GitHub Releases.
 
@@ -77,6 +113,7 @@ Scope thresholds live in `score.ts` pass 1; the reach formula in pass 2. Retunin
 
 ## Known refinements (planned)
 
+- **Coordinate-less events** - events without their own `P625` (many elections, treaties, and agreements) are currently dropped, so those categories are under-represented; a country-centroid (`P17`) fallback would capture them.
 - **LLM semantic scoring** - pass 1 is currently a structural baseline (category + fame + decade percentile); a batched, cached LLM refiner will improve `scope` and `significance`.
 - **Place hierarchy** - matching is coordinate-based; the `places` admin hierarchy will be repopulated via coordinate reverse-geocoding.
 - **R-tree spatial index** - the portable bbox columns can be upgraded to a SQLite R-tree at full scale.
