@@ -2,13 +2,13 @@
 
 *An open, geo-located historical events dataset and a deterministic timeline protocol. Give it a person's places and dates; get back a sourced timeline of the history that surrounded their life.*
 
-**Status:** v0.6 - comprehensive dataset (105k events) + event-radius engine + JSON API
+**Status:** v0.7 - comprehensive dataset (~106k events) + curated milestone seed layer (330 rows) + event-radius engine + JSON API + prune tooling
 
 ## Overview
 
 GeoHistory answers one question: *"What was happening in and around the places where someone lived, while they lived there?"* It has two parts:
 
-1. **An open events dataset** - a flat, geo-located, pre-scored SQLite table of historically significant events harvested from Wikidata.
+1. **An open events dataset** - a flat, geo-located, pre-scored SQLite table of historically significant events harvested from Wikidata, supplemented by a curated seed layer for categories (like milestone inventions) that benefit from hand review.
 2. **A deterministic timeline engine** - a pure function that takes a list of life events (place + date) and returns a ranked, cited timeline. No network calls or model inference at query time.
 
 All intelligence is computed **once, at build time**, and frozen into static columns. Query time is pure lookups, so the same file drives both a server API and an in-browser applet.
@@ -23,14 +23,16 @@ Every event is scored on two independent axes so the timeline is both *placed* a
 ## Pipeline
 
 ```
-ingest (sample)  OR  ingest:dump (comprehensive)   ->   score   ->   timeline / search / serve
+ingest (sample)  OR  ingest:dump (comprehensive)  [+ seed: curated rows]   ->   score   ->   prune (optional cleanup)   ->   timeline / search / serve
 ```
 
 1. **Harvest** - two options:
    - `ingest.ts` (`npm run ingest`): quick sample via the live Wikidata SPARQL endpoint (1900-present). Good for tests.
    - `ingest-dump.ts` (`npm run ingest:dump`): the **comprehensive build** from a local Wikidata dump - no rate limits, ~750-year window, and **true date precision**.
-2. `score.ts` (`npm run score`) derives the two axes and materializes the relevance radius.
-3. `core.ts` matches and ranks at query time using only the frozen columns.
+2. **Seed (curated rows, optional)** - `seed.ts` (`npm run seed`) merges hand-authored rows into the same `events` table, for categories that are better hand-curated than mined (currently: `milestone`, 330 invention/discovery-first events reviewed in Notion). Source rows live in era-bucketed files under `seed/` (split to avoid single-write truncation on large pushes) and are loaded idempotently: each row's id is `seed:<slug of title>`, and `ingest_version` starts with `seed-` so seed rows are always identifiable and re-seeding after an edit just upserts.
+3. `score.ts` (`npm run score`) derives the two axes and materializes the relevance radius. It **preserves the authored scope** on seed rows rather than recomputing it.
+4. **Prune (optional cleanup)** - `prune.ts` (`npm run prune <category> [floor] [apply]`) reviews and removes the least-notable rows within one category without re-running the ingest. A dry run (no floor, or a floor without `apply`) prints a notability histogram and shows how many rows each candidate floor would remove; passing `apply` deletes rows below the floor and rebuilds the FTS index. Useful for high-volume, uneven categories like `election`, where most harvested rows are minor local races.
+5. `core.ts` matches and ranks at query time using only the frozen columns.
 
 ### Comprehensive build (dumps)
 
@@ -51,6 +53,15 @@ ingest (sample)  OR  ingest:dump (comprehensive)   ->   score   ->   timeline / 
 How it works: **Pass 1** indexes every entity's coordinates (`P625`) and subclass edges (`P279`); a **closure step** expands each category's root types into their descendants via a recursive query; **Pass 2** classifies and extracts each event, resolving a person's birthplace to coordinates via the pass-1 index, and capturing each date at its real Wikidata precision (year / month / day / decade / century).
 
 Env knobs: `WIKIDATA_DUMP` (required), `INGEST_START_YEAR` (default 1275), `INGEST_END_YEAR` (default current year), `INGEST_MAX_LINES` (0 = all), `INGEST_PASS` (`coords` | `events` | `all`).
+
+### Curated seed layer
+
+Some categories are sparse or noisy straight from Wikidata (e.g. many elections, treaties, and other agreements lack their own coordinates and get dropped - see Known refinements below). For these, a small curated set can be reviewed by hand in a Notion table, exported to JSON, and merged in deterministically:
+
+- Export curated rows to `seed/*.json` using the exact Notion column names (`Title`, `Blurb`, `Date start`, `Precision`, `Category`, `Place`, `Lat`, `Lng`, `Notability`, `Scope (intended)`, `Source URL`, `Ingest version`).
+- Keep files reasonably small (tens of rows each) rather than one large file - very large single-file writes are prone to silent truncation depending on how they're pushed.
+- Add each new file to the `FILES` list in `seed.ts`, then run `npm run seed` followed by `npm run score`.
+- The `milestone` category (firsts in invention/discovery, e.g. the Moon Landing) is the first curated set, sourced from Wikipedia's "Timeline of historic inventions." Not every instance of a repeating milestone-adjacent category (e.g. presidential elections) is inherently notable - curation should keep only the genuinely important instances rather than every occurrence.
 
 ### Inspecting a build
 
@@ -92,7 +103,10 @@ The response is the exact `Timeline` object `getTimeline()` returns (`entries` +
 | `schema.sql` | SQLite schema (`events`, `places`, `meta`) + `events_fts` search index |
 | `ingest.ts` | Sample harvester via live SPARQL (1900-present) |
 | `ingest-dump.ts` | Comprehensive harvester from a local Wikidata dump (true date precision) |
-| `score.ts` | Build-time scorer: scope + significance (pass 1), reach + bbox (pass 2) |
+| `seed.ts` | Curated seed loader - merges hand-authored rows from `seed/*.json` into `events`, idempotently (`npm run seed`) |
+| `seed/*.json` | Curated event rows exported from the Notion review table (currently: `milestone` inventions, 330 rows, era-bucketed into multiple files) |
+| `score.ts` | Build-time scorer: scope + significance (pass 1), reach + bbox (pass 2); preserves authored scope on seed rows |
+| `prune.ts` | Review + delete low-notability rows within one category without a full re-ingest (`npm run prune <category> [floor] [apply]`) |
 | `core.ts` | Deterministic event-radius timeline engine (`getTimeline`) - importable, no side effects |
 | `timeline.ts` | CLI demo: runs `getTimeline` against `events.sqlite` |
 | `search.ts` | CLI full-text search over the dataset (`events_fts`) |
@@ -114,6 +128,7 @@ Scope thresholds live in `score.ts` pass 1; the reach formula in pass 2. Retunin
 ## Known refinements (planned)
 
 - **Coordinate-less events** - events without their own `P625` (many elections, treaties, and agreements) are currently dropped, so those categories are under-represented; a country-centroid (`P17`) fallback would capture them.
+- **Scope threshold skew** - for scored (non-seed) categories, `scope` is derived from a notability threshold rather than the event's true geographic nature. This can misclassify comparably important events into different reach tiers (e.g. two national elections a few notability points apart landing in `national` vs. `regional`), under-serving the lower-scoring one outside its home region. Needs its own tuning pass, separate from significance.
 - **LLM semantic scoring** - pass 1 is currently a structural baseline (category + fame + decade percentile); a batched, cached LLM refiner will improve `scope` and `significance`.
 - **Place hierarchy** - matching is coordinate-based; the `places` admin hierarchy will be repopulated via coordinate reverse-geocoding.
 - **R-tree spatial index** - the portable bbox columns can be upgraded to a SQLite R-tree at full scale.
