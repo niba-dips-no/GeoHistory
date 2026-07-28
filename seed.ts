@@ -18,7 +18,14 @@ import Database from 'better-sqlite3';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SEED_VERSION = 'seed-inventions-v0.1';
-const FILES = ['inventions.json'];
+// Split into era-bucketed files to avoid single-write truncation on large pushes.
+const FILES = [
+  'inventions.json',
+  'inventions-2-1873-1909.json',
+  'inventions-3-1911-1948.json',
+  'inventions-4-1950-1984.json',
+  'inventions-5-1986-2020.json',
+];
 
 // Curated rows are stored in the exact shape exported from the Notion review
 // table (display-name keys) so an export can be pasted in verbatim.
