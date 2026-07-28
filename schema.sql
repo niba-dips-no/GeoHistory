@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS events (
   lng            REAL,
   place_id       TEXT REFERENCES places(id),
   scope          TEXT CHECK (scope IN ('local','regional','national','global')),  -- geographic reach class
-  category       TEXT,                      -- event | conflict | election | founding | discovery | birth | death
+  category       TEXT,                      -- event | conflict | election | founding | discovery | birth | death | milestone
   notability     REAL,                      -- absolute fame proxy: normalized Wikidata sitelinks (0..1)
   significance   REAL,                      -- era-normalized importance (0..1); drives the floor + ranking
   reach_km       REAL,                      -- materialized relevance radius (derived from scope + significance)
