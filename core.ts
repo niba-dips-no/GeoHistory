@@ -77,15 +77,20 @@ export const ENGINE_VERSION = 'geohistory-core@0.4.2';
 //
 // `founding` is demoted for a related reason: sitelink count measures a place's
 // PRESENT-DAY prominence, not how far the news of its founding travelled at the
-// time, so famous places crowd out contemporaneous history (the founding of Las
-// Vegas outranking real events 961 km away). The weight demotes the category's
-// RANK; its inflated reach is corrected separately in score.ts via founding_kind.
+// time. Its inflated REACH is corrected separately in score.ts via founding_kind
+// (a settlement's founding is local), so this weight only has to handle RANK.
+//
+// 0.7 was measured, not guessed, against Pueblo CO 1902-1921: at 0.5 the 1907-1912
+// statehood entries were quota-cut out of the national tier entirely; at 1.0 they
+// crowded out the 1906 San Francisco earthquake and the Tulsa Race Massacre. 0.7
+// returns all three statehood rows AND leaves room for the Ludlow Massacre 101 km
+// away. Re-measure this if the notability ceiling is ever softened.
 export const DEFAULT_CONFIG: EngineConfig = {
   significanceFloor: 0.15,
   maxPerSegment: 12,
   maxSegments: 20,
   scopeQuota: { local: 4, regional: 3, national: 4, global: 5 },
-  categoryWeights: { birth: 0.4, death: 0.5, founding: 0.5 },
+  categoryWeights: { birth: 0.4, death: 0.5, founding: 0.7 },
 };
 
 // ===================== Date handling =====================
