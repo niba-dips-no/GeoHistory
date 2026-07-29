@@ -37,7 +37,15 @@ export interface TimelineInput {
 
 export interface TimelineEntry {
   id: string;
+  /** Raw source label, e.g. 'Arizona'. Matches what events_fts indexes. */
   title: string;
+  /**
+   * Event-phrased title for rendering, e.g. 'Arizona Statehood'. ALWAYS
+   * populated -- falls back to `title` when no display title was derived -- so
+   * clients can render this field unconditionally and never implement the
+   * fallback themselves. See display-titles.ts for which categories get one.
+   */
+  displayTitle: string;
   blurb: string | null;
   date: string;
   dateStartISO: string;
@@ -68,7 +76,7 @@ export interface Timeline {
  * Bump whenever output changes for identical input -- including tuning defaults,
  * not just code structure.
  */
-export const ENGINE_VERSION = 'geohistory-core@0.4.3';
+export const ENGINE_VERSION = 'geohistory-core@0.4.4';
 
 // Ambient-history defaults. A person's birth/death is weighted DOWN because a
 // celebrity's fame is not the same as that birth being significant local history
@@ -176,7 +184,7 @@ function haversineKm(aLat: number, aLng: number, bLat: number, bLng: number): nu
 // ===================== Core query (event-radius matching) =====================
 
 interface EventRow {
-  id: string; title: string; blurb: string | null;
+  id: string; title: string; display_title: string | null; blurb: string | null;
   date_start: string | null; date_end: string | null; date_precision: string | null;
   lat: number | null; lng: number | null;
   reach_km: number | null; significance: number | null; scope: string | null;
@@ -205,10 +213,20 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
 
   const segments = input.segments.slice(0, cfg.maxSegments);
 
+  // display_title is a later addition, and Step 1.4 bakes events.sqlite into an
+  // immutable image layer -- so probe for the column instead of assuming it, and
+  // keep working against a DB built before display-titles.ts existed.
+  let hasDisplayTitle = false;
+  try {
+    hasDisplayTitle = (db.prepare(`PRAGMA table_info(events)`).all() as Array<{ name: string }>)
+      .some((c) => c.name === 'display_title');
+  } catch { /* fall back to title-only */ }
+
   // An event matches when the observer's coordinate falls inside the event's own
   // reach box (cheap, portable spatial prefilter) -- exact haversine refines below.
   const stmt = db.prepare(`
-    SELECT id, title, blurb, date_start, date_end, date_precision, lat, lng,
+    SELECT id, title, ${hasDisplayTitle ? 'display_title' : 'NULL AS display_title'},
+           blurb, date_start, date_end, date_precision, lat, lng,
            reach_km, significance, scope, category, source_url
     FROM events
     WHERE significance >= @floor
@@ -257,7 +275,9 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
 
       totalMatched++;
       matches.push({
-        id: row.id, title: row.title, blurb: row.blurb,
+        id: row.id, title: row.title,
+        displayTitle: row.display_title?.trim() || row.title,
+        blurb: row.blurb,
         date: formatDate(ev.loISO, ev.precision),
         dateStartISO: ev.loISO, dateEndISO: ev.hiISO, precision: ev.precision,
         lat: row.lat, lng: row.lng,
@@ -341,7 +361,7 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
 export function renderMarkdown(t: Timeline): string {
   const out: string[] = [`# Timeline${t.person ? ` \u2014 ${t.person}` : ''}`, ''];
   for (const e of t.entries) {
-    out.push(`- **${e.date}** \u2014 ${e.title}`);
+    out.push(`- **${e.date}** \u2014 ${e.displayTitle}`);
     if (e.blurb) out.push(`  ${e.blurb}`);
     out.push(`  _${e.scope ?? 'n/a'} \u00b7 sig ${e.significance} \u00b7 ${e.distanceKm}/${e.reachKm} km${e.sourceUrl ? ` \u00b7 [source](${e.sourceUrl})` : ''}_`);
   }

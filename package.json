@@ -11,6 +11,7 @@
     "seed": "tsx seed.ts",
     "score": "tsx score.ts",
     "rescope:foundings": "tsx rescope-foundings.ts",
+    "titles": "tsx display-titles.ts",
     "prune": "tsx prune.ts",
     "prune:series": "tsx prune-series.ts",
     "timeline": "tsx timeline.ts",
