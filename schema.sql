@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS places (
 
 CREATE TABLE IF NOT EXISTS events (
   id             TEXT PRIMARY KEY,          -- Wikidata QID (+ optional #birth / #death / #founding suffix)
-  title          TEXT NOT NULL,
+  title          TEXT NOT NULL,             -- raw source label; indexed by events_fts, never rewritten
+  display_title  TEXT,                      -- event-phrased title derived from category/founding_kind (display-titles.ts); NULL means fall back to title
   blurb          TEXT,                      -- short description (<= 280 chars)
   date_start     TEXT NOT NULL,             -- ISO 8601, may be partial (1871, 1871-10, 1871-10-08)
   date_end       TEXT,
@@ -52,6 +53,8 @@ CREATE INDEX IF NOT EXISTS idx_events_reach_box    ON events(reach_min_lat, reac
 CREATE INDEX IF NOT EXISTS idx_places_parent       ON places(parent_id);
 
 -- Full-text search over title + blurb (external-content FTS5; rebuilt after ingest).
+-- Deliberately indexes the RAW title, not display_title: users search for the
+-- name of a place or thing, not for 'Founding of ...'.
 CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
   title, blurb, content='events', content_rowid='rowid'
 );
