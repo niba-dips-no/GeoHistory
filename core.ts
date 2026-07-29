@@ -295,8 +295,11 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
     // share up front and lets score decide only WITHIN a tier.
     //
     // Quotas are still hard ceilings, so flood control is unchanged, and slots can
-    // still go unfilled when a tier simply has no matches (the local tier is empty
-    // for most locations in the current dataset -- a data problem, not this loop's).
+    // still go unfilled when a tier genuinely has no matches. Do NOT read an empty
+    // tier as a data gap without checking here first: the local tier looked empty
+    // for Pueblo CO 1902-1921 under greedy fill, but a local match existed the
+    // whole time (David Packard's 1912 birth, 1.7 km out) and was simply always
+    // truncated.
     const cursor: Record<Scope, number> = { local: 0, regional: 0, national: 0, global: 0 };
     const kept: TimelineEntry[] = [];
     let drewOne = true;
