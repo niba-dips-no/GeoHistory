@@ -10,9 +10,9 @@ import Database from 'better-sqlite3';
 // The proper fix is a v2 ingest that retains P31. Until then we recover the
 // distinction from the one place it survives in the current file: the Wikidata
 // English description already stored in events.blurb --
-//   "city in Nevada, United States"        -> settlement
-//   "state of the United States"           -> subnational
-//   "sovereign state in South America"     -> country
+//   "city in Nevada, United States"        -> settlement   -> local
+//   "state of the United States"           -> subnational  -> national (see score.ts)
+//   "sovereign state in South America"     -> country      -> national / global
 //
 // This script writes ONLY events.founding_kind. score.ts remains the sole owner of
 // scope and reach, so the pipeline is:
@@ -107,6 +107,14 @@ function classify(blurb: string | null): FoundingKind | null {
   return null;
 }
 
+// Mirrors FOUNDING_KIND_SCOPE in score.ts -- reporting only, kept in sync by hand.
+const SCOPE_LABEL: Record<string, string> = {
+  settlement: 'local (28-52 km)',
+  subnational: 'national (1,050-1,950 km)',
+  country: 'national / global (by notability)',
+  unclassified: 'unchanged (notability ladder)',
+};
+
 // ===================== Run =====================
 
 if (RESET && !DRY) {
@@ -149,10 +157,7 @@ console.table(
     kind,
     count,
     share: rows.length ? `${((count / rows.length) * 100).toFixed(1)}%` : '-',
-    scope: kind === 'settlement' ? 'local'
-      : kind === 'subnational' ? 'regional'
-      : kind === 'country' ? 'national / global (by notability)'
-      : 'unchanged (notability ladder)',
+    scope: SCOPE_LABEL[kind] ?? '?',
   })),
 );
 

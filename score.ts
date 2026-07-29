@@ -52,8 +52,15 @@ function setMeta(key: string, value: string): void {
 // founding_kind; when it is set, it overrides the ladder.
 const FOUNDING_KIND_SCOPE: Record<string, (notability: number) => Scope> = {
   settlement: () => 'local',                                     // a town coming into existence is local news
-  subnational: () => 'regional',                                 // a state/province/county forming
-  country: (n) => (n >= 0.6 ? 'global' : 'national'),            // independence / statehood of a nation
+  // Deliberately 'national' rather than 'regional'. Admission to a federation --
+  // New Mexico, Arizona and Oklahoma becoming states in 1907-1912 -- genuinely was
+  // national news, and a regional 390 km cap dropped all of them out of a Pueblo,
+  // CO timeline covering exactly those years. The cost is that provinces, counties
+  // and departments created by administrative fiat are overweighted here. The
+  // current data cannot separate the two cases (both are bare P571 place items),
+  // and losing real statehood is the worse error. Revisit when P31 is retained.
+  subnational: () => 'national',
+  country: (n) => (n >= 0.6 ? 'global' : 'national'),            // independence / founding of a nation
 };
 
 function scopeFor(category: string | null, notability: number, foundingKind: string | null = null): Scope {
