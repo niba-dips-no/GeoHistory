@@ -12,6 +12,7 @@
     "score": "tsx score.ts",
     "rescope:foundings": "tsx rescope-foundings.ts",
     "prune": "tsx prune.ts",
+    "prune:series": "tsx prune-series.ts",
     "timeline": "tsx timeline.ts",
     "search": "tsx search.ts",
     "stats": "tsx stats.ts",
