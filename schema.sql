@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS events (
   place_id       TEXT REFERENCES places(id),
   scope          TEXT CHECK (scope IN ('local','regional','national','global')),  -- geographic reach class
   category       TEXT,                      -- event | conflict | election | founding | discovery | birth | death | milestone
+  founding_kind  TEXT CHECK (founding_kind IN ('settlement','subnational','country')),  -- founding sub-type recovered from blurb (rescope-foundings.ts); overrides the scope ladder
   notability     REAL,                      -- absolute fame proxy: normalized Wikidata sitelinks (0..1)
   significance   REAL,                      -- era-normalized importance (0..1); drives the floor + ranking
   reach_km       REAL,                      -- materialized relevance radius (derived from scope + significance)
@@ -46,6 +47,7 @@ CREATE INDEX IF NOT EXISTS idx_events_date_start   ON events(date_start);
 CREATE INDEX IF NOT EXISTS idx_events_place        ON events(place_id);
 CREATE INDEX IF NOT EXISTS idx_events_category     ON events(category);
 CREATE INDEX IF NOT EXISTS idx_events_significance ON events(significance);
+CREATE INDEX IF NOT EXISTS idx_events_founding_kind ON events(founding_kind);
 CREATE INDEX IF NOT EXISTS idx_events_reach_box    ON events(reach_min_lat, reach_max_lat, reach_min_lng, reach_max_lng);
 CREATE INDEX IF NOT EXISTS idx_places_parent       ON places(parent_id);
 

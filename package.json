@@ -10,6 +10,7 @@
     "ingest:dump": "tsx ingest-dump.ts",
     "seed": "tsx seed.ts",
     "score": "tsx score.ts",
+    "rescope:foundings": "tsx rescope-foundings.ts",
     "prune": "tsx prune.ts",
     "timeline": "tsx timeline.ts",
     "search": "tsx search.ts",

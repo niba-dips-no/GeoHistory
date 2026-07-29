@@ -9,7 +9,7 @@ import Database from 'better-sqlite3';
 //   npm run score reach      -> pass 2 only (reach_km + bbox) -- the cheap no-LLM patch
 
 const MODE = (process.argv[2] ?? 'all').toLowerCase(); // 'all' | 'scores' | 'reach'
-const SCORING_VERSION = 'struct-v0.3';
+const SCORING_VERSION = 'struct-v0.4';
 const REACH_VERSION = 'reach-v0.1';
 
 const db = new Database('events.sqlite');
@@ -22,6 +22,7 @@ function migrate(): void {
   const cols = [
     'significance REAL', 'reach_km REAL',
     'reach_min_lat REAL', 'reach_max_lat REAL', 'reach_min_lng REAL', 'reach_max_lng REAL',
+    'founding_kind TEXT',
   ];
   for (const c of cols) {
     try { db.exec(`ALTER TABLE events ADD COLUMN ${c};`); } catch { /* column already exists */ }
@@ -41,11 +42,29 @@ function setMeta(key: string, value: string): void {
 // everyone alive at the time (a WWII battle is context for a Chicagoan, not just
 // for people near the battlefield). This is the structural baseline; the LLM
 // refiner will later overwrite these labels semantically.
-function scopeFor(category: string | null, notability: number): Scope {
+//
+// FOUNDING is a special case. The ingest discards P31, so a settlement's
+// incorporation and a territory's statehood are indistinguishable here, and the
+// notability ladder below sent both to 'national' (a 1,950 km reach) whenever the
+// place is well known today. But sitelink count measures a place's PRESENT-DAY
+// prominence, not how far the news of its founding actually travelled at the time.
+// rescope-foundings.ts recovers the missing distinction from events.blurb into
+// founding_kind; when it is set, it overrides the ladder.
+const FOUNDING_KIND_SCOPE: Record<string, (notability: number) => Scope> = {
+  settlement: () => 'local',                                     // a town coming into existence is local news
+  subnational: () => 'regional',                                 // a state/province/county forming
+  country: (n) => (n >= 0.6 ? 'global' : 'national'),            // independence / statehood of a nation
+};
+
+function scopeFor(category: string | null, notability: number, foundingKind: string | null = null): Scope {
   switch (category) {
     case 'election':  return notability >= 0.5 ? 'national' : 'regional';
     case 'conflict':  return notability >= 0.6 ? 'global' : notability >= 0.3 ? 'national' : notability >= 0.15 ? 'regional' : 'local';
-    case 'founding':  return notability >= 0.75 ? 'national' : notability >= 0.4 ? 'regional' : 'local';
+    case 'founding': {
+      const byKind = foundingKind ? FOUNDING_KIND_SCOPE[foundingKind] : undefined;
+      if (byKind) return byKind(notability);
+      return notability >= 0.75 ? 'national' : notability >= 0.4 ? 'regional' : 'local';
+    }
     case 'discovery': return notability >= 0.4 ? 'global' : 'national';
     // milestone (inventions / first-of-its-kind): full 4-tier ladder so minor
     // novelties stay local while world-changing firsts reach everyone.
@@ -58,10 +77,10 @@ function scopeFor(category: string | null, notability: number): Scope {
   }
 }
 
-interface ScoreRow { id: string; category: string | null; notability: number | null; date_start: string | null; scope: string | null; ingest_version: string | null; }
+interface ScoreRow { id: string; category: string | null; notability: number | null; date_start: string | null; scope: string | null; ingest_version: string | null; founding_kind: string | null; }
 
 function runScoring(): void {
-  const rows = db.prepare(`SELECT id, category, notability, date_start, scope, ingest_version FROM events`).all() as ScoreRow[];
+  const rows = db.prepare(`SELECT id, category, notability, date_start, scope, ingest_version, founding_kind FROM events`).all() as ScoreRow[];
 
   // Era-normalize: significance = percentile of notability WITHIN the event's decade.
   // This is what keeps sparse historical decades from being buried under modern volume.
@@ -87,6 +106,7 @@ function runScoring(): void {
   };
 
   const upd = db.prepare(`UPDATE events SET scope = @scope, significance = @significance WHERE id = @id`);
+  let byKind = 0;
   const tx = db.transaction((items: ScoreRow[]) => {
     for (const r of items) {
       const notability = typeof r.notability === 'number' ? r.notability : 0;
@@ -94,7 +114,8 @@ function runScoring(): void {
       // Curated seed rows carry an authored scope; preserve it rather than deriving
       // one from the structural formula, so hand-tuned relevance tiers survive scoring.
       const isSeed = typeof r.ingest_version === 'string' && r.ingest_version.startsWith('seed-');
-      const scope = (isSeed && r.scope) ? r.scope : scopeFor(r.category, notability);
+      if (r.category === 'founding' && r.founding_kind && FOUNDING_KIND_SCOPE[r.founding_kind]) byKind++;
+      const scope = (isSeed && r.scope) ? r.scope : scopeFor(r.category, notability, r.founding_kind);
       upd.run({ id: r.id, scope, significance });
     }
   });
@@ -102,6 +123,7 @@ function runScoring(): void {
   setMeta('scoring_version', SCORING_VERSION);
   setMeta('scored_at', new Date().toISOString());
   console.log(`Pass 1: scored ${rows.length} events (scope + era-normalized significance; authored scope preserved for seed rows).`);
+  console.log(`  founding rows scoped by founding_kind: ${byKind.toLocaleString()} (run "npm run rescope:foundings" to classify more).`);
 }
 
 // ---------- pass 2: reach_km + bounding box (pure formula; the cheap patch) ----------

@@ -63,16 +63,29 @@ export interface Timeline {
   meta: { segmentCount: number; totalMatched: number; returned: number };
 }
 
+/**
+ * Engine identity stamped onto every Timeline and reported by GET /v1/meta.
+ * Bump whenever output changes for identical input -- including tuning defaults,
+ * not just code structure.
+ */
+export const ENGINE_VERSION = 'geohistory-core@0.4.2';
+
 // Ambient-history defaults. A person's birth/death is weighted DOWN because a
 // celebrity's fame is not the same as that birth being significant local history
 // at the time. Per-scope quotas guarantee a blend (local color + world context)
 // rather than letting one tier -- births or battles -- monopolize the slots.
+//
+// `founding` is demoted for a related reason: sitelink count measures a place's
+// PRESENT-DAY prominence, not how far the news of its founding travelled at the
+// time, so famous places crowd out contemporaneous history (the founding of Las
+// Vegas outranking real events 961 km away). The weight demotes the category's
+// RANK; its inflated reach is corrected separately in score.ts via founding_kind.
 export const DEFAULT_CONFIG: EngineConfig = {
   significanceFloor: 0.15,
   maxPerSegment: 12,
   maxSegments: 20,
   scopeQuota: { local: 4, regional: 3, national: 4, global: 5 },
-  categoryWeights: { birth: 0.4, death: 0.5 },
+  categoryWeights: { birth: 0.4, death: 0.5, founding: 0.5 },
 };
 
 // ===================== Date handling =====================
@@ -223,7 +236,7 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
       if (distanceKm > row.reach_km) continue; // exact reach-circle test
 
       const significance = typeof row.significance === 'number' ? row.significance : 0;
-      const weight = cfg.categoryWeights[row.category ?? ''] ?? 1; // demote births/deaths vs substantive history
+      const weight = cfg.categoryWeights[row.category ?? ''] ?? 1; // demote births/deaths/foundings vs substantive history
       const headroom = 1 - Math.min(1, distanceKm / row.reach_km); // 1 at the event, 0 at the edge
       const score = Math.round(significance * weight * (0.6 + 0.4 * headroom) * 1000) / 1000;
 
@@ -269,7 +282,7 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
   return {
     datasetVersion,
     person: input.person,
-    generatedWith: 'geohistory-core@0.4.1',
+    generatedWith: ENGINE_VERSION,
     entries,
     meta: { segmentCount: segments.length, totalMatched, returned: entries.length },
   };
