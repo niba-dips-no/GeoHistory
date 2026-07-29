@@ -68,12 +68,14 @@ export interface Timeline {
  * Bump whenever output changes for identical input -- including tuning defaults,
  * not just code structure.
  */
-export const ENGINE_VERSION = 'geohistory-core@0.4.2';
+export const ENGINE_VERSION = 'geohistory-core@0.4.3';
 
 // Ambient-history defaults. A person's birth/death is weighted DOWN because a
 // celebrity's fame is not the same as that birth being significant local history
 // at the time. Per-scope quotas guarantee a blend (local color + world context)
 // rather than letting one tier -- births or battles -- monopolize the slots.
+// That guarantee is delivered by the round-robin fill in getTimeline; the quota
+// numbers alone cannot do it (see the comment on the fill loop).
 //
 // `founding` is demoted for a related reason: sitelink count measures a place's
 // PRESENT-DAY prominence, not how far the news of its founding travelled at the
@@ -92,6 +94,14 @@ export const DEFAULT_CONFIG: EngineConfig = {
   scopeQuota: { local: 4, regional: 3, national: 4, global: 5 },
   categoryWeights: { birth: 0.4, death: 0.5, founding: 0.7 },
 };
+
+/**
+ * Tier draw order for the round-robin fill: most geographically specific first.
+ * When maxPerSegment is smaller than the sum of the quotas, the tiers listed
+ * first are the ones guaranteed a slot -- and local/regional are exactly the
+ * tiers that lose every tiebreak on raw score, so they are drawn first.
+ */
+const TIER_ORDER: Scope[] = ['local', 'regional', 'national', 'global'];
 
 // ===================== Date handling =====================
 
@@ -263,19 +273,49 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
       a.dateStartISO !== b.dateStartISO ? (a.dateStartISO < b.dateStartISO ? -1 : 1) :
       a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
-    // Fill per-scope quotas from the top-scoring matches so the segment gets a
-    // BLEND across tiers instead of one tier (births, or battles) taking every slot.
-    const perScope: Record<Scope, number> = { local: 0, regional: 0, national: 0, global: 0 };
-    let kept = 0;
+    // Bucket the matches by tier, preserving the score order established above.
+    // Anything with a missing or unrecognized scope is treated as local, which is
+    // the conservative reading: an event we cannot place is not world history.
+    const pools: Record<Scope, TimelineEntry[]> = { local: [], regional: [], national: [], global: [] };
     for (const m of matches) {
       if (seen.has(m.id)) continue; // an event appears once, under its best-scoring segment
-      const sc = (m.scope ?? 'local') as Scope;
-      const quota = cfg.scopeQuota[sc] ?? cfg.maxPerSegment;
-      if (perScope[sc] >= quota) continue;
+      const raw = (m.scope ?? 'local') as Scope;
+      const sc: Scope = TIER_ORDER.includes(raw) ? raw : 'local';
+      pools[sc].push(m);
+    }
+
+    // Draw ROUND-ROBIN across tiers rather than greedily by score, so the quotas
+    // are guarantees and not merely caps.
+    //
+    // The greedy version took the top maxPerSegment matches overall and let the
+    // quotas cut the overflow. Since the quotas sum to 16 and a caller typically
+    // asks for 10, the tiers that score highest -- global and national, which win
+    // on fame -- consumed every slot, and the local/regional tiers this product
+    // exists to surface were truncated first. Round-robin reserves each tier its
+    // share up front and lets score decide only WITHIN a tier.
+    //
+    // Quotas are still hard ceilings, so flood control is unchanged, and slots can
+    // still go unfilled when a tier simply has no matches (the local tier is empty
+    // for most locations in the current dataset -- a data problem, not this loop's).
+    const cursor: Record<Scope, number> = { local: 0, regional: 0, national: 0, global: 0 };
+    const kept: TimelineEntry[] = [];
+    let drewOne = true;
+    while (kept.length < cfg.maxPerSegment && drewOne) {
+      drewOne = false;
+      for (const sc of TIER_ORDER) {
+        if (kept.length >= cfg.maxPerSegment) break;
+        const quota = cfg.scopeQuota[sc] ?? cfg.maxPerSegment;
+        const next = cursor[sc];
+        if (next >= quota || next >= pools[sc].length) continue; // tier capped or exhausted
+        kept.push(pools[sc][next]);
+        cursor[sc] = next + 1;
+        drewOne = true;
+      }
+    }
+
+    for (const m of kept) {
       seen.add(m.id);
       entries.push(m);
-      perScope[sc]++;
-      if (++kept >= cfg.maxPerSegment) break;
     }
   });
 
