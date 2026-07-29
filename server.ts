@@ -2,7 +2,7 @@ import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import Database from 'better-sqlite3';
-import { getTimeline, renderMarkdown, DEFAULT_CONFIG, type TimelineInput } from './core';
+import { getTimeline, renderMarkdown, DEFAULT_CONFIG, ENGINE_VERSION, type TimelineInput } from './core';
 
 // ===================== geohistory JSON API (v1) =====================
 // A thin, dependency-free HTTP wrapper (Node built-in http) around the
@@ -250,18 +250,57 @@ function datasetMeta(): Record<string, unknown> {
 }
 
 /**
+ * events.sqlite is a LAYERED artifact, and meta.dataset_version names only the
+ * bottom layer (the modal ingest_version). A single file can carry an ingest
+ * label, a scoring pass, a reach pass, classification passes, and any number of
+ * prunes -- all of which change what a client gets back while leaving
+ * dataset_version untouched. Reading 'dump-v0.5' off a deployed image therefore
+ * says almost nothing about what is in it, which matters once Step 1.4 bakes
+ * the file into a read-only image layer.
+ *
+ * The id is DERIVED from what the DB records about itself rather than
+ * hand-maintained, so it cannot go stale the way the hardcoded engine string
+ * did. Note that `npm run score` restamps dataset_version and so changes this
+ * id -- correct, because that is a different artifact.
+ */
+function datasetBuild(m: Record<string, unknown>): {
+  id: string;
+  layers: { ingest: string | null; scoring: string | null; reach: string | null; prunes: string[] };
+} {
+  const str = (k: string): string | null => (typeof m[k] === 'string' && m[k] ? (m[k] as string) : null);
+  const layers = {
+    ingest: str('dataset_version'),
+    scoring: str('scoring_version'),
+    reach: str('reach_version'),
+    // Full stamps, e.g. 'election<0.25 removed 1047 at <ISO>'. Order is fixed so
+    // the id is stable for a given file.
+    prunes: [str('last_prune'), str('last_series_prune')].filter((v): v is string => v !== null),
+  };
+  const id = [
+    layers.ingest ?? 'unknown-ingest',
+    layers.scoring ?? 'unscored',
+    layers.reach ?? 'no-reach',
+    layers.prunes.length > 0 ? `prune${layers.prunes.length}` : 'unpruned',
+  ].join('+');
+  return { id, layers };
+}
+
+/**
  * GET /v1/meta payload. Publishing DEFAULT_CONFIG is the point of this route:
  * clients (Circa) can read the engine's own tuning defaults instead of
  * restating them, so a server-side retune propagates without a client release.
  */
 function metaPayload(): Record<string, unknown> {
   const m = datasetMeta();
+  const build = datasetBuild(m);
   return {
     service: SERVICE,
     apiVersion: API_VERSION,
     serviceVersion: SERVICE_VERSION,
-    engine: 'geohistory-core@0.4.1',
+    engine: ENGINE_VERSION,
     datasetVersion: (m as any).dataset_version ?? null,
+    datasetBuild: build.id,
+    datasetLayers: build.layers,
     dataset: m,
     defaults: DEFAULT_CONFIG,
     limits: {
@@ -422,7 +461,8 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 server.listen(PORT, () => {
   const m = datasetMeta();
   console.log(`${SERVICE} listening on http://localhost:${PORT} (${API_VERSION})`);
-  console.log(`  dataset ${(m as any).dataset_version ?? 'unknown'} - ${Number(m.totalEvents).toLocaleString()} events`);
+  console.log(`  engine   ${ENGINE_VERSION}`);
+  console.log(`  build    ${datasetBuild(m).id} - ${Number(m.totalEvents).toLocaleString()} events`);
   console.log(`  routes:  GET /v1/health  GET /v1/meta  GET /v1/search  POST /v1/timeline`);
   console.log(`  origins: ${ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS.join(', ') : (ALLOW_DEV_ORIGINS ? 'dev localhost only (ALLOWED_ORIGIN unset)' : 'none — set ALLOWED_ORIGIN')}`);
-}); 
+});
