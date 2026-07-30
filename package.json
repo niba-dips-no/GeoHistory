@@ -14,6 +14,7 @@
     "titles": "tsx display-titles.ts",
     "prune": "tsx prune.ts",
     "prune:series": "tsx prune-series.ts",
+    "prune:dupes": "tsx prune-seed-dupes.ts",
     "timeline": "tsx timeline.ts",
     "search": "tsx search.ts",
     "stats": "tsx stats.ts",
