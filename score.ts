@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { isInstitution } from './classify';
 
 // ===================== Build-time scorer =====================
 // Two independently-patchable passes, both fully deterministic and baked into the
@@ -9,7 +10,7 @@ import Database from 'better-sqlite3';
 //   npm run score reach      -> pass 2 only (reach_km + bbox) -- the cheap no-LLM patch
 
 const MODE = (process.argv[2] ?? 'all').toLowerCase(); // 'all' | 'scores' | 'reach'
-const SCORING_VERSION = 'struct-v0.5';
+const SCORING_VERSION = 'struct-v0.6';
 const REACH_VERSION = 'reach-v0.2';
 
 const db = new Database('events.sqlite');
@@ -61,9 +62,35 @@ const FOUNDING_KIND_SCOPE: Record<string, (notability: number) => Scope> = {
   // and losing real statehood is the worse error. Revisit when P31 is retained.
   subnational: () => 'national',
   country: (n) => (n >= 0.6 ? 'global' : 'national'),            // independence / founding of a nation
+  institution: (n) => INSTITUTION_SCOPE(n),                      // see below
 };
 
-function scopeFor(category: string | null, notability: number, foundingKind: string | null = null): Scope {
+// An institution's FOUNDING is local or regional news no matter how famous the
+// institution later becomes. Notability cannot tell the difference, because it is
+// sitelinks/100 -- a measure of present-day prominence. That is how York University
+// (notability 1.0, category 'event') reached global scope and a 20,038 km radius,
+// putting a 1959 Toronto campus opening ahead of the Depression, WWII and the moon
+// landing on a Charleston WV timeline.
+//
+// Regional (300 km) is the ceiling: a major university or company genuinely is
+// regional news when it opens. Below 0.5 it is local, which is where a suburban
+// campus or a single hospital belongs.
+const INSTITUTION_SCOPE = (notability: number): Scope => (notability >= 0.5 ? 'regional' : 'local');
+
+function scopeFor(
+  category: string | null,
+  notability: number,
+  foundingKind: string | null = null,
+  blurb: string | null = null,
+): Scope {
+  // Applies across categories because the ingest files institutions inconsistently:
+  // York University landed in 'event', DeVry University in 'event', and others in
+  // 'founding'. Person rows are exempt -- they are already local, and a blurb like
+  // "founder of the university" should not reclassify the person.
+  if (category !== 'birth' && category !== 'death' && isInstitution(blurb)) {
+    return INSTITUTION_SCOPE(notability);
+  }
+
   switch (category) {
     case 'election':  return notability >= 0.5 ? 'national' : 'regional';
     case 'conflict':  return notability >= 0.6 ? 'global' : notability >= 0.3 ? 'national' : notability >= 0.15 ? 'regional' : 'local';
@@ -72,7 +99,12 @@ function scopeFor(category: string | null, notability: number, foundingKind: str
       if (byKind) return byKind(notability);
       return notability >= 0.75 ? 'national' : notability >= 0.4 ? 'regional' : 'local';
     }
-    case 'discovery': return notability >= 0.4 ? 'global' : 'national';
+    // Was `notability >= 0.4 ? 'global' : 'national'` -- two rungs, with no way to
+    // express anything below national. Every obscure discovery therefore carried a
+    // 1,050+ km reach: Griffin Television Tower Oklahoma, notability 0.07, was
+    // national context for a quarter of a continent. Now a full 4-tier ladder,
+    // matching the shape already used by milestone and event.
+    case 'discovery': return notability >= 0.4 ? 'global' : notability >= 0.2 ? 'national' : notability >= 0.1 ? 'regional' : 'local';
     // milestone (inventions / first-of-its-kind): full 4-tier ladder so minor
     // novelties stay local while world-changing firsts reach everyone.
     case 'milestone': return notability >= 0.75 ? 'global' : notability >= 0.45 ? 'national' : notability >= 0.25 ? 'regional' : 'local';
@@ -103,10 +135,10 @@ function scopeFor(category: string | null, notability: number, foundingKind: str
 const PERSON_CATEGORIES = new Set(['birth', 'death']);
 const isPersonRow = (category: string | null): boolean => PERSON_CATEGORIES.has(category ?? '');
 
-interface ScoreRow { id: string; category: string | null; notability: number | null; date_start: string | null; scope: string | null; ingest_version: string | null; founding_kind: string | null; }
+interface ScoreRow { id: string; category: string | null; notability: number | null; date_start: string | null; scope: string | null; ingest_version: string | null; founding_kind: string | null; blurb: string | null; }
 
 function runScoring(): void {
-  const rows = db.prepare(`SELECT id, category, notability, date_start, scope, ingest_version, founding_kind FROM events`).all() as ScoreRow[];
+  const rows = db.prepare(`SELECT id, category, notability, date_start, scope, ingest_version, founding_kind, blurb FROM events`).all() as ScoreRow[];
 
   // Era-normalize: significance = percentile of notability WITHIN the event's decade,
   // among rows of the same kind (person vs history). This is what keeps sparse
@@ -139,6 +171,8 @@ function runScoring(): void {
   const upd = db.prepare(`UPDATE events SET scope = @scope, significance = @significance WHERE id = @id`);
   let byKind = 0;
   let persons = 0;
+  let institutions = 0;
+  let demoted = 0;
   const tx = db.transaction((items: ScoreRow[]) => {
     for (const r of items) {
       const notability = typeof r.notability === 'number' ? r.notability : 0;
@@ -149,7 +183,13 @@ function runScoring(): void {
       // one from the structural formula, so hand-tuned relevance tiers survive scoring.
       const isSeed = typeof r.ingest_version === 'string' && r.ingest_version.startsWith('seed-');
       if (r.category === 'founding' && r.founding_kind && FOUNDING_KIND_SCOPE[r.founding_kind]) byKind++;
-      const scope = (isSeed && r.scope) ? r.scope : scopeFor(r.category, notability, r.founding_kind);
+      const scope = (isSeed && r.scope) ? r.scope : scopeFor(r.category, notability, r.founding_kind, r.blurb);
+      if (!isSeed && !isPersonRow(r.category) && isInstitution(r.blurb)) {
+        institutions++;
+        // Reported so a bad pattern shows up as a spike rather than silently
+        // shrinking half the corpus.
+        if (r.scope === 'global' || r.scope === 'national') demoted++;
+      }
       upd.run({ id: r.id, scope, significance });
     }
   });
@@ -159,6 +199,7 @@ function runScoring(): void {
   console.log(`Pass 1: scored ${rows.length} events (scope + era-normalized significance; authored scope preserved for seed rows).`);
   console.log(`  percentiled separately: ${(rows.length - persons).toLocaleString()} history rows, ${persons.toLocaleString()} person rows (birth/death).`);
   console.log(`  founding rows scoped by founding_kind: ${byKind.toLocaleString()} (run "npm run rescope:foundings" to classify more).`);
+  console.log(`  institution rows capped at regional/local: ${institutions.toLocaleString()} (${demoted.toLocaleString()} were previously national or global).`);
 }
 
 // ---------- pass 2: reach_km + bounding box (pure formula; the cheap patch) ----------
