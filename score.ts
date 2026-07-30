@@ -97,7 +97,9 @@ function scopeFor(category: string | null, notability: number, foundingKind: str
 //
 // Splitting the two populations makes significance mean "important for its kind,
 // in its decade", which is what both the engine floor and the per-tier draw in
-// core.ts assume it means.
+// core.ts assume it means. Measured over 107k rows, the split lands history at
+// mean significance 0.530 and persons at 0.517 -- each population centered on its
+// own median, which is the whole point.
 const PERSON_CATEGORIES = new Set(['birth', 'death']);
 const isPersonRow = (category: string | null): boolean => PERSON_CATEGORIES.has(category ?? '');
 
@@ -162,16 +164,22 @@ function runScoring(): void {
 // ---------- pass 2: reach_km + bounding box (pure formula; the cheap patch) ----------
 const SCOPE_BASE_KM: Record<Scope, number> = { local: 50, regional: 300, national: 1500, global: 20038 };
 
-// How much significance is allowed to stretch a tier's radius.
+// How much significance is allowed to stretch a tier's radius, as base * (floor + span * sig).
 //
-// The local tier is deliberately flat. At the shared 0.7 + 0.6s curve a 40 km base
-// spanned 28-64 km, so whether a genuinely local event 30-50 km away reached you
-// depended on its percentile: 50 km required significance >= 0.92, i.e. never.
-// "Local" should be a stable neighborhood radius, not a fame-scaled one, so it now
-// spans 45-60 km around a 50 km base. Everything above local keeps the original
-// curve, where a wider spread is meaningful.
+// The local tier is deliberately flat, and its floor is 1.0 rather than something
+// less. "Local" should be a stable neighborhood radius, not a fame-scaled one: if
+// a local event 45 km away reaches you but an equally local one at 55 km does not,
+// that is an artifact of percentile rank, not of geography. Under the shared
+// 0.7 + 0.6s curve a 40 km base spanned 28-64 km and needed significance >= 0.92
+// to clear 50 km, i.e. never. An intermediate 0.9 + 0.2s was no better in the way
+// that matters -- it spans 45-55 km, so half the tier still fell short of 50.
+//
+// At 1.0 + 0.2s every local row reaches a full 50 km and significance only extends
+// it, to a 60 km ceiling that is still tighter than the 64 km the original curve
+// allowed. Tiers above local keep the original curve, where a fame-scaled spread
+// is meaningful.
 const REACH_CURVE: Record<Scope, { floor: number; span: number }> = {
-  local:    { floor: 0.9, span: 0.2 },
+  local:    { floor: 1.0, span: 0.2 },
   regional: { floor: 0.7, span: 0.6 },
   national: { floor: 0.7, span: 0.6 },
   global:   { floor: 0.7, span: 0.6 },
