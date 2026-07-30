@@ -4,7 +4,8 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import Database from 'better-sqlite3';
 
 // ===================== Seed/dump duplicate pruner =====================
-// Applies the hand-adjudicated verdicts in dupe-drop.tsv and dupe-merge.tsv.
+// Applies the hand-adjudicated verdicts in seed/dupe/dupe-drop.tsv and
+// seed/dupe/dupe-merge.tsv.
 //
 //   npm run prune:dupes             -> apply
 //   npm run prune:dupes -- --dry-run -> report only, touch nothing
@@ -14,8 +15,8 @@ import Database from 'better-sqlite3';
 // after PLACES, so a seed row "Albania declares its independence from the
 // Ottoman Empire" (1912-11-28) collides with the dump's entity row for the
 // country Albania, whose founding date is that same day. Same fact, two
-// shapes. 547 candidate pairs were adjudicated one at a time; the two TSVs
-// consumed here are that adjudication, and this script is the only mechanism
+// shapes. 547 candidate pairs were adjudicated one at a time; the TSVs in
+// seed/dupe/ are that adjudication, and this script is the only mechanism
 // that should apply them.
 //
 // Two verdict classes are actionable:
@@ -23,7 +24,7 @@ import Database from 'better-sqlite3';
 //   drop-seed  -- the dump row wins outright (real coordinates, a derived
 //                 scope, and a proper event title where ours is place-titled,
 //                 e.g. "Battle of Trafalgar" vs our "Trafalgar"). The seed row
-//                 is removed from seed/*.json and from the DB.
+//                 is removed from seed/*.json and from the DB. 258 rows.
 //
 //   merge-date -- same fact, but the dump row carries a YEAR-precision
 //                 placeholder date (Ghana's independence sits at 1957-01-01)
@@ -35,8 +36,8 @@ import Database from 'better-sqlite3';
 // same-title/different-event pairs (Nigeria alone has four seed rows against
 // one dump entity: independence, then three renamings) plus title collisions
 // with same-named American settlements -- our Athens matched a village in
-// Michigan, our Waterloo matched Monroe County, Illinois. dupe-keep.tsv exists
-// for auditing only.
+// Michigan, our Waterloo matched Monroe County, Illinois. dupe-keep.tsv is
+// committed for auditing only; nothing reads it.
 //
 // Ordering. This runs AFTER `npm run seed` and AFTER `npm run ingest:dump`,
 // and BEFORE `npm run score`. Re-ingesting the dump restores the placeholder
@@ -48,9 +49,10 @@ import Database from 'better-sqlite3';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DRY_RUN = process.argv.includes('--dry-run');
 
-// The TSVs live at the repo root by default; --dir lets you point elsewhere.
+// The verdict files are committed under seed/dupe/; --dir points elsewhere.
 const dirArg = process.argv.findIndex((a) => a === '--dir');
-const TSV_DIR = dirArg !== -1 && process.argv[dirArg + 1] ? process.argv[dirArg + 1] : __dirname;
+const TSV_DIR =
+  dirArg !== -1 && process.argv[dirArg + 1] ? process.argv[dirArg + 1] : join(__dirname, 'seed', 'dupe');
 
 // Only the timeline files can contain adjudicated rows; the curated invention
 // files were never part of the duplicate scan, so they are left untouched.
@@ -91,7 +93,7 @@ function rowId(r: RawRow): string {
 function readTsv(name: string): Array<Record<string, string>> {
   const path = join(TSV_DIR, name);
   if (!existsSync(path)) {
-    throw new Error(`Missing ${path}. Place dupe-drop.tsv and dupe-merge.tsv at the repo root, or pass --dir <folder>.`);
+    throw new Error(`Missing ${path}. The verdict files belong in seed/dupe/, or pass --dir <folder>.`);
   }
   const text = readFileSync(path, 'utf8').replace(/^\uFEFF/, '');
   const lines = text.split(/\r?\n/).filter((l) => l.length > 0);
@@ -216,7 +218,10 @@ console.log(`\nSeed rows removed from JSON: ${removedFromJson}`);
 if (unmatched.size > 0) {
   // Non-fatal, but worth surfacing: an id in the verdicts that no JSON row
   // claims usually means a title or Seed ID was edited after adjudication.
-  console.log(`WARNING: ${unmatched.size} verdict id(s) matched no row in the seed files:`);
+  // On a second run this is EXPECTED for every id -- the rows are already gone.
+  console.log(`NOTE: ${unmatched.size} verdict id(s) matched no row in the seed files.`);
+  console.log('  On a first run this means a title or Seed ID drifted since adjudication.');
+  console.log('  On a re-run it is expected: those rows have already been pruned.');
   for (const id of [...unmatched].slice(0, 10)) console.log(`  ${id}`);
   if (unmatched.size > 10) console.log(`  ... and ${unmatched.size - 10} more`);
 }
