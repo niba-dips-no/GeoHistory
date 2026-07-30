@@ -31,6 +31,13 @@ const FILES = [
   'inventions-3-1911-1948.json',
   'inventions-4-1950-1984.json',
   'inventions-5-1986-2020.json',
+  // Wikipedia timeline + century pages, 1275 AD onward. Every row sets an
+  // explicit "Seed ID" because these are titled after places, not events.
+  'timeline-wikipedia-1-pre1700.json',
+  'timeline-wikipedia-2-1700-1849.json',
+  'timeline-wikipedia-3-1850-1919.json',
+  'timeline-wikipedia-4-1920-1979.json',
+  'timeline-wikipedia-5-1980-present.json',
 ];
 
 // Curated rows are stored in the exact shape exported from the Notion review
