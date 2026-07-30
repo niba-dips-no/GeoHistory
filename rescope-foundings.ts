@@ -14,6 +14,18 @@ import Database from 'better-sqlite3';
 //   "state of the United States"           -> subnational  -> national (see score.ts)
 //   "sovereign state in South America"     -> country      -> national / global
 //
+// founding_kind now drives RANK as well as scope: core.ts resolves its per-row
+// weight through DEFAULT_CONFIG.foundingKindWeights (settlement 0.35, institution
+// 0.5, subnational 0.9, country 0.9) before falling back to categoryWeights.
+// A row left unclassified therefore keeps both the old notability-ladder scope and
+// the old flat 0.7 weight -- classification is now worth more than it used to be.
+//
+// KNOWN GAP: there is no 'institution' pattern set yet, so universities, companies,
+// museums and clubs fall through to unclassified and are scored on raw sitelink
+// notability. Because sitelinks measure present-day prominence rather than
+// contemporary importance, a well-known institution can inherit a very large reach
+// from a founding that was purely local at the time.
+//
 // This script writes ONLY events.founding_kind. score.ts remains the sole owner of
 // scope and reach, so the pipeline is:
 //
@@ -107,12 +119,13 @@ function classify(blurb: string | null): FoundingKind | null {
   return null;
 }
 
-// Mirrors FOUNDING_KIND_SCOPE in score.ts -- reporting only, kept in sync by hand.
+// Mirrors FOUNDING_KIND_SCOPE in score.ts and foundingKindWeights in core.ts --
+// reporting only, kept in sync by hand.
 const SCOPE_LABEL: Record<string, string> = {
-  settlement: 'local (28-52 km)',
-  subnational: 'national (1,050-1,950 km)',
-  country: 'national / global (by notability)',
-  unclassified: 'unchanged (notability ladder)',
+  settlement: 'local (50-60 km), rank weight 0.35',
+  subnational: 'national (1,050-1,950 km), rank weight 0.9',
+  country: 'national / global (by notability), rank weight 0.9',
+  unclassified: 'unchanged (notability ladder), rank weight 0.7',
 };
 
 // ===================== Run =====================
