@@ -9,8 +9,8 @@ import Database from 'better-sqlite3';
 //   npm run score reach      -> pass 2 only (reach_km + bbox) -- the cheap no-LLM patch
 
 const MODE = (process.argv[2] ?? 'all').toLowerCase(); // 'all' | 'scores' | 'reach'
-const SCORING_VERSION = 'struct-v0.4';
-const REACH_VERSION = 'reach-v0.1';
+const SCORING_VERSION = 'struct-v0.5';
+const REACH_VERSION = 'reach-v0.2';
 
 const db = new Database('events.sqlite');
 db.pragma('journal_mode = WAL');
@@ -84,28 +84,50 @@ function scopeFor(category: string | null, notability: number, foundingKind: str
   }
 }
 
+// Person rows are ranked against other person rows, never against history.
+//
+// Two different instruments feed `notability`. Dump events use sitelinks/100 with
+// per-category floors as low as 3 sitelinks, so their long tail sits at 0.03-0.12.
+// Humans enter at a 30-sitelink floor, so every person row starts at 0.30 by
+// construction. Percentiling both against one decade-wide distribution meant a
+// decade's biographical volume decided what counted as significant history: a
+// curated county-level event at notability 0.12 was ranked below every birth and
+// death in the decade and fell under the engine's significance floor, while the
+// births themselves were flattered by the events' long tail.
+//
+// Splitting the two populations makes significance mean "important for its kind,
+// in its decade", which is what both the engine floor and the per-tier draw in
+// core.ts assume it means.
+const PERSON_CATEGORIES = new Set(['birth', 'death']);
+const isPersonRow = (category: string | null): boolean => PERSON_CATEGORIES.has(category ?? '');
+
 interface ScoreRow { id: string; category: string | null; notability: number | null; date_start: string | null; scope: string | null; ingest_version: string | null; founding_kind: string | null; }
 
 function runScoring(): void {
   const rows = db.prepare(`SELECT id, category, notability, date_start, scope, ingest_version, founding_kind FROM events`).all() as ScoreRow[];
 
-  // Era-normalize: significance = percentile of notability WITHIN the event's decade.
-  // This is what keeps sparse historical decades from being buried under modern volume.
+  // Era-normalize: significance = percentile of notability WITHIN the event's decade,
+  // among rows of the same kind (person vs history). This is what keeps sparse
+  // historical decades from being buried under modern volume.
   const decadeOf = (ds: string | null): number => {
     const y = parseInt(String(ds ?? '').slice(0, 4), 10);
     return Number.isFinite(y) ? Math.floor(y / 10) * 10 : 0;
   };
-  const byDecade = new Map<number, number[]>();
+  const byDecade = { person: new Map<number, number[]>(), history: new Map<number, number[]>() };
+  const bucketOf = (r: ScoreRow) => (isPersonRow(r.category) ? byDecade.person : byDecade.history);
   for (const r of rows) {
     const d = decadeOf(r.date_start);
-    let arr = byDecade.get(d);
-    if (!arr) { arr = []; byDecade.set(d, arr); }
+    const map = bucketOf(r);
+    let arr = map.get(d);
+    if (!arr) { arr = []; map.set(d, arr); }
     arr.push(typeof r.notability === 'number' ? r.notability : 0);
   }
-  for (const arr of byDecade.values()) arr.sort((a, b) => a - b);
+  for (const map of [byDecade.person, byDecade.history]) {
+    for (const arr of map.values()) arr.sort((a, b) => a - b);
+  }
 
-  const percentile = (decade: number, n: number): number => {
-    const arr = byDecade.get(decade);
+  const percentile = (map: Map<number, number[]>, decade: number, n: number): number => {
+    const arr = map.get(decade);
     if (!arr || arr.length <= 1) return 0.5;
     let lo = 0, hi = arr.length;
     while (lo < hi) { const mid = (lo + hi) >> 1; if (arr[mid] <= n) lo = mid + 1; else hi = mid; }
@@ -114,10 +136,13 @@ function runScoring(): void {
 
   const upd = db.prepare(`UPDATE events SET scope = @scope, significance = @significance WHERE id = @id`);
   let byKind = 0;
+  let persons = 0;
   const tx = db.transaction((items: ScoreRow[]) => {
     for (const r of items) {
       const notability = typeof r.notability === 'number' ? r.notability : 0;
-      const significance = Math.round(percentile(decadeOf(r.date_start), notability) * 1000) / 1000;
+      const map = bucketOf(r);
+      if (isPersonRow(r.category)) persons++;
+      const significance = Math.round(percentile(map, decadeOf(r.date_start), notability) * 1000) / 1000;
       // Curated seed rows carry an authored scope; preserve it rather than deriving
       // one from the structural formula, so hand-tuned relevance tiers survive scoring.
       const isSeed = typeof r.ingest_version === 'string' && r.ingest_version.startsWith('seed-');
@@ -130,11 +155,27 @@ function runScoring(): void {
   setMeta('scoring_version', SCORING_VERSION);
   setMeta('scored_at', new Date().toISOString());
   console.log(`Pass 1: scored ${rows.length} events (scope + era-normalized significance; authored scope preserved for seed rows).`);
+  console.log(`  percentiled separately: ${(rows.length - persons).toLocaleString()} history rows, ${persons.toLocaleString()} person rows (birth/death).`);
   console.log(`  founding rows scoped by founding_kind: ${byKind.toLocaleString()} (run "npm run rescope:foundings" to classify more).`);
 }
 
 // ---------- pass 2: reach_km + bounding box (pure formula; the cheap patch) ----------
-const SCOPE_BASE_KM: Record<Scope, number> = { local: 40, regional: 300, national: 1500, global: 20038 };
+const SCOPE_BASE_KM: Record<Scope, number> = { local: 50, regional: 300, national: 1500, global: 20038 };
+
+// How much significance is allowed to stretch a tier's radius.
+//
+// The local tier is deliberately flat. At the shared 0.7 + 0.6s curve a 40 km base
+// spanned 28-64 km, so whether a genuinely local event 30-50 km away reached you
+// depended on its percentile: 50 km required significance >= 0.92, i.e. never.
+// "Local" should be a stable neighborhood radius, not a fame-scaled one, so it now
+// spans 45-60 km around a 50 km base. Everything above local keeps the original
+// curve, where a wider spread is meaningful.
+const REACH_CURVE: Record<Scope, { floor: number; span: number }> = {
+  local:    { floor: 0.9, span: 0.2 },
+  regional: { floor: 0.7, span: 0.6 },
+  national: { floor: 0.7, span: 0.6 },
+  global:   { floor: 0.7, span: 0.6 },
+};
 
 interface ReachRow { id: string; lat: number | null; lng: number | null; scope: string | null; significance: number | null; }
 
@@ -152,13 +193,14 @@ function runReach(): void {
       const lat = r.lat as number;
       const lng = r.lng as number;
       const base = SCOPE_BASE_KM[scope] ?? SCOPE_BASE_KM.local;
+      const curve = REACH_CURVE[scope] ?? REACH_CURVE.local;
 
       let reach_km: number, minLat: number, maxLat: number, minLng: number, maxLng: number;
       if (scope === 'global') {
         reach_km = SCOPE_BASE_KM.global; // half Earth circumference -> matches everywhere
         minLat = -90; maxLat = 90; minLng = -180; maxLng = 180;
       } else {
-        reach_km = Math.round(base * (0.7 + 0.6 * sig)); // more significant -> reaches a bit further
+        reach_km = Math.round(base * (curve.floor + curve.span * sig)); // more significant -> reaches a bit further
         const dLat = reach_km / 111;
         const dLng = reach_km / (111 * Math.max(0.2, Math.cos(lat * Math.PI / 180)));
         minLat = Math.max(-90, lat - dLat); maxLat = Math.min(90, lat + dLat);
