@@ -13,8 +13,14 @@ import Database from 'better-sqlite3';
 //   npm run score    -> (run afterwards) computes significance + reach; the scorer
 //                       PRESERVES each seed row's authored scope.
 //
-// Idempotent: id = "seed:<slug of title>"; the upsert refreshes mutable fields so
-// editing the JSON and re-seeding applies the edits. Fails fast on id collisions.
+// Idempotent: id = "seed:<slug of Seed ID, else title>"; the upsert refreshes
+// mutable fields so editing the JSON and re-seeding applies the edits. Fails fast
+// on id collisions.
+//
+// A note on ids: deriving the id from the title alone assumes titles are globally
+// unique. That holds for the curated invention rows (each names a distinct thing)
+// but NOT for timeline rows titled after a place -- "Hungary" or "Canada" legitimately
+// recur across centuries. Such files must set an explicit "Seed ID" per row.
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SEED_VERSION = 'seed-inventions-v0.1';
@@ -42,6 +48,10 @@ interface RawRow {
   'Scope (intended)': 'local' | 'regional' | 'national' | 'global';
   'Source URL': string | null;
   'Ingest version'?: string | null;
+  // Optional stable identifier. When present it replaces the title as the basis
+  // for the row id, which is what lets files with repeated titles load at all.
+  // Changing it after a seed run creates a NEW row rather than updating the old one.
+  'Seed ID'?: string | null;
 }
 
 function slugify(s: string): string {
@@ -78,7 +88,7 @@ const upsert = db.prepare(`
     ingest_version = excluded.ingest_version
 `);
 
-const seenIds = new Set<string>();
+const seenIds = new Map<string, string>(); // id -> "file: title" of first claimant
 let total = 0;
 
 function loadFile(name: string): void {
@@ -87,9 +97,22 @@ function loadFile(name: string): void {
     for (const r of items) {
       const title = (r.Title ?? '').trim();
       if (!title) continue;
-      const id = `seed:${slugify(title)}`;
-      if (seenIds.has(id)) throw new Error(`Duplicate seed id "${id}" (title: ${title}). Give the row a more distinct title.`);
-      seenIds.add(id);
+
+      // Prefer the curator-authored Seed ID; fall back to the title so existing
+      // seed files keep the exact ids they were first loaded with.
+      const explicit = (r['Seed ID'] ?? '').trim();
+      const id = `seed:${slugify(explicit || title)}`;
+
+      const prior = seenIds.get(id);
+      if (prior !== undefined) {
+        const suggestion = slugify(`${title}-${r['Date start'] ?? ''}`);
+        throw new Error(
+          `Duplicate seed id "${id}" in seed/${name} (title: ${title}); already claimed by ${prior}. ` +
+            `Give this row a unique "Seed ID", e.g. "${suggestion}".`,
+        );
+      }
+      seenIds.set(id, `${name}: ${title}`);
+
       upsert.run({
         id,
         title,
