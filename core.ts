@@ -34,6 +34,7 @@ export interface EngineConfig {
   scopeQuota: Record<Scope, number>;     // per-segment cap PER scope tier (the flood control)
   personQuota: number;                   // per-segment cap for birth/death rows
   categoryWeights: Record<string, number>; // rank multipliers; unspecified categories default to 1
+  foundingKindWeights: Record<string, number>; // rank multipliers for founding rows, by founding_kind
 }
 
 export type TimelineConfigInput = Partial<EngineConfig>;
@@ -85,7 +86,7 @@ export interface Timeline {
  * Bump whenever output changes for identical input -- including tuning defaults,
  * not just code structure.
  */
-export const ENGINE_VERSION = 'geohistory-core@0.5.0';
+export const ENGINE_VERSION = 'geohistory-core@0.5.1';
 
 /** Categories drawn from the 'person' tier rather than their nominal scope. */
 const PERSON_CATEGORIES = new Set(['birth', 'death']);
@@ -97,17 +98,6 @@ const SCOPES: Scope[] = ['local', 'regional', 'national', 'global'];
 // rather than letting one tier -- births or battles -- monopolize the slots.
 // That guarantee is delivered by the round-robin fill in getTimeline; the quota
 // numbers alone cannot do it (see the comment on the fill loop).
-//
-// `founding` is demoted for a related reason: sitelink count measures a place's
-// PRESENT-DAY prominence, not how far the news of its founding travelled at the
-// time. Its inflated REACH is corrected separately in score.ts via founding_kind
-// (a settlement's founding is local), so this weight only has to handle RANK.
-//
-// 0.7 was measured, not guessed, against Pueblo CO 1902-1921: at 0.5 the 1907-1912
-// statehood entries were quota-cut out of the national tier entirely; at 1.0 they
-// crowded out the 1906 San Francisco earthquake and the Tulsa Race Massacre. 0.7
-// returns all three statehood rows AND leaves room for the Ludlow Massacre 101 km
-// away. Re-measure this if the notability ceiling is ever softened.
 //
 // The category weight was never enough to keep biography secondary on its own,
 // because score.ts scopes birth/death as 'local' and the weight only orders rows
@@ -131,6 +121,32 @@ export const DEFAULT_CONFIG: EngineConfig = {
   scopeQuota: { local: 4, regional: 3, national: 4, global: 5 },
   personQuota: 2,
   categoryWeights: { birth: 0.4, death: 0.5, founding: 0.7 },
+
+  // `founding` covers two events that have nothing to do with each other: a town
+  // filing incorporation papers, and a territory becoming a state or a colony
+  // becoming a country. score.ts already separates their REACH via founding_kind;
+  // these weights separate their RANK, which reach cannot do because both land in
+  // a tier alongside genuine history.
+  //
+  // The corpus makes the case: 37,895 settlement rows at avg notability 0.188 vs
+  // 2,192 subnational rows at 0.501. And because notability is sitelink-derived --
+  // present-day prominence, not contemporary importance -- a settlement founding
+  // can top its tier outright: Oklahoma City is settlement/local at significance
+  // 1.0, and bare village foundings (Lincolnwood 0.85, Forest View 0.834) were
+  // beating the UN Charter for slots in a Chicago timeline.
+  //
+  // A single flat 0.7 could not serve both ends. It was measured against Pueblo CO
+  // 1902-1921 under the OLD significance distribution, and once pass 1 stopped
+  // ranking history against biography, non-founding national rows rose and 0.7
+  // dropped Oklahoma and New Mexico statehood out of that timeline entirely.
+  // 0.9 restores them above the rescored Tulsa Race Massacre without disturbing
+  // the tier's ordering otherwise.
+  //
+  // 'institution' is not emitted by rescope-foundings.ts yet -- universities,
+  // companies and museums currently fall through to the unclassified fallback.
+  // The key is defined here so the classifier has somewhere to land when it does.
+  // Unclassified founding rows keep categoryWeights.founding (0.7).
+  foundingKindWeights: { settlement: 0.35, institution: 0.5, subnational: 0.9, country: 0.9 },
 };
 
 /**
@@ -220,7 +236,7 @@ interface EventRow {
   date_start: string | null; date_end: string | null; date_precision: string | null;
   lat: number | null; lng: number | null;
   reach_km: number | null; significance: number | null; scope: string | null;
-  category: string | null; source_url: string | null;
+  category: string | null; founding_kind: string | null; source_url: string | null;
 }
 
 function normalizeEventDate(row: EventRow): DateRange {
@@ -249,6 +265,7 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
     scopeQuota: { ...DEFAULT_CONFIG.scopeQuota, ...(input.config?.scopeQuota ?? {}) },
     personQuota: input.config?.personQuota ?? DEFAULT_CONFIG.personQuota,
     categoryWeights: { ...DEFAULT_CONFIG.categoryWeights, ...(input.config?.categoryWeights ?? {}) },
+    foundingKindWeights: { ...DEFAULT_CONFIG.foundingKindWeights, ...(input.config?.foundingKindWeights ?? {}) },
   };
 
   // A caller that sets only significanceFloor means it as a global floor, so drop
@@ -267,6 +284,19 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
     return cfg.scopeFloor[scope] ?? cfg.significanceFloor;
   };
 
+  /**
+   * Rank multiplier. Founding rows resolve through founding_kind first, so a town
+   * incorporating and a territory achieving statehood are not ranked as the same
+   * kind of event; unclassified foundings fall back to categoryWeights.founding.
+   */
+  const weightFor = (category: string | null, foundingKind: string | null): number => {
+    if (category === 'founding' && foundingKind) {
+      const w = cfg.foundingKindWeights[foundingKind];
+      if (typeof w === 'number') return w;
+    }
+    return cfg.categoryWeights[category ?? ''] ?? 1;
+  };
+
   // The SQL prefilter can only apply one number, so it applies the loosest floor in
   // play and keeps using idx_events_significance; the exact per-tier floor is
   // enforced per row below.
@@ -277,21 +307,23 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
 
   const segments = input.segments.slice(0, cfg.maxSegments);
 
-  // display_title is a later addition, and Step 1.4 bakes events.sqlite into an
-  // immutable image layer -- so probe for the column instead of assuming it, and
-  // keep working against a DB built before display-titles.ts existed.
-  let hasDisplayTitle = false;
+  // display_title and founding_kind are later additions, and Step 1.4 bakes
+  // events.sqlite into an immutable image layer -- so probe for the columns instead
+  // of assuming them, and keep working against a DB built before they existed.
+  let columns = new Set<string>();
   try {
-    hasDisplayTitle = (db.prepare(`PRAGMA table_info(events)`).all() as Array<{ name: string }>)
-      .some((c) => c.name === 'display_title');
-  } catch { /* fall back to title-only */ }
+    for (const c of db.prepare(`PRAGMA table_info(events)`).all() as Array<{ name: string }>) columns.add(c.name);
+  } catch { /* fall back to the minimal column set */ }
+  const hasDisplayTitle = columns.has('display_title');
+  const hasFoundingKind = columns.has('founding_kind');
 
   // An event matches when the observer's coordinate falls inside the event's own
   // reach box (cheap, portable spatial prefilter) -- exact haversine refines below.
   const stmt = db.prepare(`
     SELECT id, title, ${hasDisplayTitle ? 'display_title' : 'NULL AS display_title'},
            blurb, date_start, date_end, date_precision, lat, lng,
-           reach_km, significance, scope, category, source_url
+           reach_km, significance, scope, category,
+           ${hasFoundingKind ? 'founding_kind' : 'NULL AS founding_kind'}, source_url
     FROM events
     WHERE significance >= @floor
       AND reach_km IS NOT NULL
@@ -335,7 +367,7 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
       const distanceKm = haversineKm(seg.place.lat, seg.place.lng, row.lat, row.lng);
       if (distanceKm > row.reach_km) continue; // exact reach-circle test
 
-      const weight = cfg.categoryWeights[row.category ?? ''] ?? 1; // demote births/deaths/foundings vs substantive history
+      const weight = weightFor(row.category, row.founding_kind); // demote biography and bare foundings vs substantive history
       const headroom = 1 - Math.min(1, distanceKm / row.reach_km); // 1 at the event, 0 at the edge
       const score = Math.round(significance * weight * (0.6 + 0.4 * headroom) * 1000) / 1000;
 
@@ -375,11 +407,14 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
     // are guarantees and not merely caps.
     //
     // The greedy version took the top maxPerSegment matches overall and let the
-    // quotas cut the overflow. Since the quotas sum to 16 and a caller typically
+    // quotas cut the overflow. Since the quotas sum to 18 and a caller typically
     // asks for 10, the tiers that score highest -- global and national, which win
     // on fame -- consumed every slot, and the local/regional tiers this product
     // exists to surface were truncated first. Round-robin reserves each tier its
     // share up front and lets score decide only WITHIN a tier.
+    //
+    // Note for callers: because the quotas sum to 18, raising maxPerSegment beyond
+    // 18 adds nothing on its own -- the quotas have to move too.
     //
     // Quotas are still hard ceilings, so flood control is unchanged, and slots can
     // still go unfilled when a tier genuinely has no matches. Do NOT read an empty
