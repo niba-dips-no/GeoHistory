@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { isInstitution } from './classify';
 
 // ===================== Founding sub-type classifier (stopgap) =====================
 // `ingest-dump.ts` uses an item's P31 types to pick a category and then discards
@@ -13,6 +14,7 @@ import Database from 'better-sqlite3';
 //   "city in Nevada, United States"        -> settlement   -> local
 //   "state of the United States"           -> subnational  -> national (see score.ts)
 //   "sovereign state in South America"     -> country      -> national / global
+//   "university in Toronto, Ontario"       -> institution  -> regional / local
 //
 // founding_kind now drives RANK as well as scope: core.ts resolves its per-row
 // weight through DEFAULT_CONFIG.foundingKindWeights (settlement 0.35, institution
@@ -20,11 +22,10 @@ import Database from 'better-sqlite3';
 // A row left unclassified therefore keeps both the old notability-ladder scope and
 // the old flat 0.7 weight -- classification is now worth more than it used to be.
 //
-// KNOWN GAP: there is no 'institution' pattern set yet, so universities, companies,
-// museums and clubs fall through to unclassified and are scored on raw sitelink
-// notability. Because sitelinks measure present-day prominence rather than
-// contemporary importance, a well-known institution can inherit a very large reach
-// from a founding that was purely local at the time.
+// NOTE: institution rows are ALSO handled directly in score.ts, because the ingest
+// files institutions inconsistently -- York University and DeVry University both
+// landed in category 'event', where this script never sees them. The shared test
+// lives in classify.ts so both paths agree.
 //
 // This script writes ONLY events.founding_kind. score.ts remains the sole owner of
 // scope and reach, so the pipeline is:
@@ -53,7 +54,7 @@ db.pragma('journal_mode = WAL');
 try { db.exec('ALTER TABLE events ADD COLUMN founding_kind TEXT;'); } catch { /* column already exists */ }
 db.exec('CREATE INDEX IF NOT EXISTS idx_events_founding_kind ON events(founding_kind);');
 
-type FoundingKind = 'settlement' | 'subnational' | 'country';
+type FoundingKind = 'settlement' | 'subnational' | 'country' | 'institution';
 
 // An explicit settlement noun is decisive even when the description also names the
 // containing state or country ("city in the state of Nevada", "capital city of Peru").
@@ -103,15 +104,19 @@ const COUNTRY: RegExp[] = [
 
 /**
  * Order is load-bearing:
- *   1. settlement nouns win outright,
- *   2. "sovereign state" beats the generic "state of/in" subnational rule,
- *   3. subnational divisions beat the generic country rules,
- *   4. remaining country wording.
+ *   1. institutions win outright -- "university in the city of Toronto" is a
+ *      university, not a settlement, and the settlement rule would otherwise
+ *      claim it on the word "city",
+ *   2. settlement nouns next,
+ *   3. "sovereign state" beats the generic "state of/in" subnational rule,
+ *   4. subnational divisions beat the generic country rules,
+ *   5. remaining country wording.
  * Anything unmatched returns null and keeps the old notability-ladder behavior.
  */
 function classify(blurb: string | null): FoundingKind | null {
   if (!blurb) return null;
   const b = blurb.toLowerCase();
+  if (isInstitution(blurb)) return 'institution';
   if (SETTLEMENT.some((re) => re.test(b))) return 'settlement';
   if (/\bsovereign state\b/.test(b) || /\bindependent (country|state|nation)\b/.test(b)) return 'country';
   if (SUBNATIONAL.some((re) => re.test(b))) return 'subnational';
@@ -123,6 +128,7 @@ function classify(blurb: string | null): FoundingKind | null {
 // reporting only, kept in sync by hand.
 const SCOPE_LABEL: Record<string, string> = {
   settlement: 'local (50-60 km), rank weight 0.35',
+  institution: 'regional (210-300 km) or local, rank weight 0.5',
   subnational: 'national (1,050-1,950 km), rank weight 0.9',
   country: 'national / global (by notability), rank weight 0.9',
   unclassified: 'unchanged (notability ladder), rank weight 0.7',
@@ -145,7 +151,7 @@ const rows = db.prepare(`
   ${LIMIT ? 'LIMIT ' + LIMIT : ''}
 `).all() as Row[];
 
-const tally: Record<string, number> = { settlement: 0, subnational: 0, country: 0, unclassified: 0 };
+const tally: Record<string, number> = { settlement: 0, institution: 0, subnational: 0, country: 0, unclassified: 0 };
 const decided: Array<{ id: string; kind: FoundingKind }> = [];
 const unclassified: Row[] = [];
 
