@@ -5,6 +5,13 @@ import type Database from 'better-sqlite3';
 export type Precision = 'day' | 'month' | 'year' | 'decade' | 'century';
 export type Scope = 'local' | 'regional' | 'national' | 'global';
 
+/**
+ * Draw tiers for the round-robin fill. Identical to Scope plus 'person', which
+ * is not a scope a row can carry -- it is derived from category at draw time so
+ * births and deaths stop competing with local history. See TIER_ORDER.
+ */
+export type Tier = Scope | 'person';
+
 export interface PlaceInput {
   name: string;
   lat: number;
@@ -21,9 +28,11 @@ export interface SegmentInput {
 
 export interface EngineConfig {
   significanceFloor: number;             // events below this era-normalized importance are dropped
+  scopeFloor: Partial<Record<Scope, number>>; // per-tier override of significanceFloor
   maxPerSegment: number;                 // hard cap on entries contributed per life segment
   maxSegments: number;
   scopeQuota: Record<Scope, number>;     // per-segment cap PER scope tier (the flood control)
+  personQuota: number;                   // per-segment cap for birth/death rows
   categoryWeights: Record<string, number>; // rank multipliers; unspecified categories default to 1
 }
 
@@ -76,7 +85,11 @@ export interface Timeline {
  * Bump whenever output changes for identical input -- including tuning defaults,
  * not just code structure.
  */
-export const ENGINE_VERSION = 'geohistory-core@0.4.4';
+export const ENGINE_VERSION = 'geohistory-core@0.5.0';
+
+/** Categories drawn from the 'person' tier rather than their nominal scope. */
+const PERSON_CATEGORIES = new Set(['birth', 'death']);
+const SCOPES: Scope[] = ['local', 'regional', 'national', 'global'];
 
 // Ambient-history defaults. A person's birth/death is weighted DOWN because a
 // celebrity's fame is not the same as that birth being significant local history
@@ -95,21 +108,40 @@ export const ENGINE_VERSION = 'geohistory-core@0.4.4';
 // crowded out the 1906 San Francisco earthquake and the Tulsa Race Massacre. 0.7
 // returns all three statehood rows AND leaves room for the Ludlow Massacre 101 km
 // away. Re-measure this if the notability ceiling is ever softened.
+//
+// The category weight was never enough to keep biography secondary on its own,
+// because score.ts scopes birth/death as 'local' and the weight only orders rows
+// WITHIN a tier. A famous person at significance 0.95 still scored 0.38 against a
+// curated local event at 0.30 -- inside the four local slots, which the fill draws
+// first precisely because that tier loses every tiebreak on raw score. Biography
+// now draws from its own tier instead, and the weights below only rank persons
+// against each other.
+//
+// scopeFloor exists because a single percentile floor assumes one population. It
+// is not: dump events enter at a 3-12 sitelink floor (a long tail at 0.03-0.12)
+// while humans enter at 30 sitelinks, and curated seed rows carry hand-authored
+// notability on a third scale entirely. 0.05 for local admits curated
+// neighborhood history that 0.15 was silently cutting; the higher global floor
+// tightens the tier that matches everyone on Earth and is the most crowded.
 export const DEFAULT_CONFIG: EngineConfig = {
   significanceFloor: 0.15,
+  scopeFloor: { local: 0.05, regional: 0.15, national: 0.15, global: 0.2 },
   maxPerSegment: 12,
   maxSegments: 20,
   scopeQuota: { local: 4, regional: 3, national: 4, global: 5 },
+  personQuota: 2,
   categoryWeights: { birth: 0.4, death: 0.5, founding: 0.7 },
 };
 
 /**
- * Tier draw order for the round-robin fill: most geographically specific first.
- * When maxPerSegment is smaller than the sum of the quotas, the tiers listed
- * first are the ones guaranteed a slot -- and local/regional are exactly the
- * tiers that lose every tiebreak on raw score, so they are drawn first.
+ * Tier draw order for the round-robin fill: most geographically specific first,
+ * biography last. When maxPerSegment is smaller than the sum of the quotas, the
+ * tiers listed first are the ones guaranteed a slot -- and local/regional are
+ * exactly the tiers that lose every tiebreak on raw score, so they are drawn
+ * first. 'person' is drawn last for the same reason in reverse: births and
+ * deaths win on fame and would otherwise crowd out the history around them.
  */
-const TIER_ORDER: Scope[] = ['local', 'regional', 'national', 'global'];
+const TIER_ORDER: Tier[] = ['local', 'regional', 'national', 'global', 'person'];
 
 // ===================== Date handling =====================
 
@@ -202,14 +234,46 @@ function normalizeEventDate(row: EventRow): DateRange {
   return { loISO: s.loISO, hiISO, precision };
 }
 
+/** Normalize a stored scope string to a known tier, defaulting to the conservative one. */
+function scopeOf(raw: string | null): Scope {
+  const s = (raw ?? 'local') as Scope;
+  return SCOPES.includes(s) ? s : 'local';
+}
+
 export function getTimeline(db: Database.Database, input: TimelineInput): Timeline {
   const cfg: EngineConfig = {
     significanceFloor: input.config?.significanceFloor ?? DEFAULT_CONFIG.significanceFloor,
+    scopeFloor: { ...DEFAULT_CONFIG.scopeFloor, ...(input.config?.scopeFloor ?? {}) },
     maxPerSegment: input.config?.maxPerSegment ?? DEFAULT_CONFIG.maxPerSegment,
     maxSegments: input.config?.maxSegments ?? DEFAULT_CONFIG.maxSegments,
     scopeQuota: { ...DEFAULT_CONFIG.scopeQuota, ...(input.config?.scopeQuota ?? {}) },
+    personQuota: input.config?.personQuota ?? DEFAULT_CONFIG.personQuota,
     categoryWeights: { ...DEFAULT_CONFIG.categoryWeights, ...(input.config?.categoryWeights ?? {}) },
   };
+
+  // A caller that sets only significanceFloor means it as a global floor, so drop
+  // any default per-scope override that would sit below it. Explicit scopeFloor
+  // entries still win -- that is what the knob is for.
+  if (input.config?.significanceFloor !== undefined) {
+    const explicit = input.config?.scopeFloor ?? {};
+    for (const sc of SCOPES) {
+      if (explicit[sc] === undefined) cfg.scopeFloor[sc] = Math.max(cfg.scopeFloor[sc] ?? 0, cfg.significanceFloor);
+    }
+  }
+
+  /** Person rows keep the global floor even though score.ts scopes them local. */
+  const floorFor = (category: string | null, scope: Scope): number => {
+    if (PERSON_CATEGORIES.has(category ?? '')) return cfg.significanceFloor;
+    return cfg.scopeFloor[scope] ?? cfg.significanceFloor;
+  };
+
+  // The SQL prefilter can only apply one number, so it applies the loosest floor in
+  // play and keeps using idx_events_significance; the exact per-tier floor is
+  // enforced per row below.
+  const minFloor = Math.min(
+    cfg.significanceFloor,
+    ...SCOPES.map((sc) => cfg.scopeFloor[sc]).filter((v): v is number => typeof v === 'number'),
+  );
 
   const segments = input.segments.slice(0, cfg.maxSegments);
 
@@ -251,7 +315,7 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
     const segHi = (seg.end ? parseDate(seg.end) : parseDate(seg.start)).hiISO;
 
     const rows = stmt.all({
-      floor: cfg.significanceFloor,
+      floor: minFloor,
       lat: seg.place.lat,
       lng: seg.place.lng,
       loYear: segLo.slice(0, 4),
@@ -262,13 +326,15 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
     for (const row of rows) {
       if (row.lat == null || row.lng == null || !row.date_start || row.reach_km == null) continue;
 
+      const significance = typeof row.significance === 'number' ? row.significance : 0;
+      if (significance < floorFor(row.category, scopeOf(row.scope))) continue; // exact per-tier floor
+
       const ev = normalizeEventDate(row);
       if (!rangesOverlap(ev.loISO, ev.hiISO, segLo, segHi)) continue;
 
       const distanceKm = haversineKm(seg.place.lat, seg.place.lng, row.lat, row.lng);
       if (distanceKm > row.reach_km) continue; // exact reach-circle test
 
-      const significance = typeof row.significance === 'number' ? row.significance : 0;
       const weight = cfg.categoryWeights[row.category ?? ''] ?? 1; // demote births/deaths/foundings vs substantive history
       const headroom = 1 - Math.min(1, distanceKm / row.reach_km); // 1 at the event, 0 at the edge
       const score = Math.round(significance * weight * (0.6 + 0.4 * headroom) * 1000) / 1000;
@@ -296,12 +362,13 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
     // Bucket the matches by tier, preserving the score order established above.
     // Anything with a missing or unrecognized scope is treated as local, which is
     // the conservative reading: an event we cannot place is not world history.
-    const pools: Record<Scope, TimelineEntry[]> = { local: [], regional: [], national: [], global: [] };
+    // Births and deaths are pulled out of local into their own tier so biography
+    // cannot consume the slots reserved for the history around it.
+    const pools: Record<Tier, TimelineEntry[]> = { local: [], regional: [], national: [], global: [], person: [] };
     for (const m of matches) {
       if (seen.has(m.id)) continue; // an event appears once, under its best-scoring segment
-      const raw = (m.scope ?? 'local') as Scope;
-      const sc: Scope = TIER_ORDER.includes(raw) ? raw : 'local';
-      pools[sc].push(m);
+      const tier: Tier = PERSON_CATEGORIES.has(m.category ?? '') ? 'person' : scopeOf(m.scope);
+      pools[tier].push(m);
     }
 
     // Draw ROUND-ROBIN across tiers rather than greedily by score, so the quotas
@@ -319,15 +386,15 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
     // tier as a data gap without checking here first: the local tier looked empty
     // for Pueblo CO 1902-1921 under greedy fill, but a local match existed the
     // whole time (David Packard's 1912 birth, 1.7 km out) and was simply always
-    // truncated.
-    const cursor: Record<Scope, number> = { local: 0, regional: 0, national: 0, global: 0 };
+    // truncated. That row now draws from the person tier.
+    const cursor: Record<Tier, number> = { local: 0, regional: 0, national: 0, global: 0, person: 0 };
     const kept: TimelineEntry[] = [];
     let drewOne = true;
     while (kept.length < cfg.maxPerSegment && drewOne) {
       drewOne = false;
       for (const sc of TIER_ORDER) {
         if (kept.length >= cfg.maxPerSegment) break;
-        const quota = cfg.scopeQuota[sc] ?? cfg.maxPerSegment;
+        const quota = sc === 'person' ? cfg.personQuota : (cfg.scopeQuota[sc] ?? cfg.maxPerSegment);
         const next = cursor[sc];
         if (next >= quota || next >= pools[sc].length) continue; // tier capped or exhausted
         kept.push(pools[sc][next]);
