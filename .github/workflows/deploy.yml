@@ -1,0 +1,103 @@
+# =============================================================================
+# Deploy to Fly.io -- DORMANT
+# =============================================================================
+# STATUS: not in use. Fly requires a payment method before a new organization
+# can create machines, so there is no Fly app behind this. The active host is
+# Render, which builds from the repository on its own (see render.yaml) and
+# needs no workflow here.
+#
+# This file is kept, not deleted. The image is host-agnostic -- the Dockerfile
+# pulls the dataset from the GitHub release, so it builds identically anywhere.
+# If Fly is ever revisited, the only prerequisites are the one-time setup below
+# and restoring the `push` trigger.
+#
+# It runs on workflow_dispatch ONLY. On a push trigger it would fail on every
+# commit to main, and a permanently red repository teaches you to stop reading
+# the red.
+#
+# ---------------------------------------------------------------------------
+# ONE-TIME SETUP, IF FLY IS EVER USED
+# ---------------------------------------------------------------------------
+# 1. Fly app + token:
+#      fly launch --no-deploy --copy-config --name geohistory-api
+#      fly tokens create deploy -x 999999h
+#    Save the token as repository secret FLY_API_TOKEN
+#    (Settings -> Secrets and variables -> Actions -> New repository secret).
+#
+# 2. CORS allowlist -- set to wherever Circa is hosted, NOT to this API's URL:
+#      fly secrets set ALLOWED_ORIGIN=https://circa.pages.dev
+#
+# 3. Publish the dataset (from the folder holding a scored events.sqlite):
+#      gh release create dataset-latest events.sqlite \
+#        --title "Dataset" --notes "dump-v0.5+struct-v0.6+reach-v0.2+prune3"
+#
+# ---------------------------------------------------------------------------
+# PUBLISHING A NEW DATASET
+# ---------------------------------------------------------------------------
+# This applies to Render too -- the release asset IS the deployed dataset.
+# Reuse the same tag so every build finds the current file:
+#      gh release upload dataset-latest events.sqlite --clobber
+# Then redeploy. Bump DATASET_VERSION in the Dockerfile, or clear the build
+# cache, or the build will reuse a cached layer holding the old database.
+# =============================================================================
+
+name: Deploy (Fly, manual)
+
+on:
+  workflow_dispatch:
+
+# Never let two deploys race. Unlike CI, an in-flight deploy is NOT cancelled --
+# interrupting a release mid-rollout is worse than waiting for it.
+concurrency:
+  group: deploy-fly
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------------
+      # Deploy
+      # ---------------------------------------------------------------------
+      # No dataset download step: the Dockerfile fetches events.sqlite from the
+      # release itself, so the build context no longer has to carry it.
+      - name: Set up flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: flyctl deploy --remote-only --wait-timeout 300
+
+      # ---------------------------------------------------------------------
+      # Verify the release is actually serving
+      # ---------------------------------------------------------------------
+      # A successful release only means the machine started and /v1/health
+      # answered, and /v1/health does not touch the database. /v1/meta does --
+      # and printing the dataset build makes a stale release asset visible in
+      # the job log rather than discovered by a tester.
+      - name: Verify deployment
+        run: |
+          set -euo pipefail
+          url="https://geohistory-api.fly.dev/v1/meta"
+          for attempt in 1 2 3 4 5; do
+            if body=$(curl -fsS --max-time 20 "$url"); then
+              echo "$body" | head -c 2000
+              build=$(echo "$body" | grep -o '"datasetBuild": *"[^"]*"' | head -1)
+              total=$(echo "$body" | grep -o '"totalEvents": *[0-9]*' | head -1)
+              echo "::notice::Deployed. $build $total"
+              exit 0
+            fi
+            echo "Attempt $attempt failed; machine may still be starting."
+            sleep 10
+          done
+          echo "::error::/v1/meta did not respond after the release."
+          exit 1
