@@ -157,7 +157,7 @@ COPY --from=deps /app/node_modules ./node_modules
 # .dockerignore is the second line of defence, not the first.
 COPY package.json ./
 COPY tsconfig.json ./
-COPY server.ts core.ts ./
+COPY server.ts core.ts feedback.ts ./
 
 # ---------------------------------------------------------------------------
 # The dataset
