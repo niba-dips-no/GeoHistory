@@ -28,7 +28,7 @@ export const FEEDBACK_CONFIGURED = Boolean(WEBHOOK_URL && SECRET);
 // ===================== The accepted shape =====================
 
 const VERDICTS = ['up', 'down'] as const;
-const SCOPES = ['local', 'regional', 'national', 'global'] as const;
+const SCOPES = ['local', 'regional', 'national', 'global', 'unclassified'] as const;
 
 // Nine buckets, not six. The national tier's observed range is roughly
 // 1050-2400 km, so a single 500+ bucket would have swallowed the majority of
