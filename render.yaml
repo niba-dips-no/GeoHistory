@@ -1,10 +1,9 @@
 # =============================================================================
 # Render blueprint -- GeoHistory API
 # =============================================================================
-# Render can be set up entirely through its dashboard. This file exists so the
-# deployment is described in the repository instead of living only in a web UI,
-# for the same reason fly.toml does: config that nobody can review is config
-# that drifts.
+# Render is the live API point. This file exists so the deployment is described
+# in the repository instead of living only in a web UI: config that nobody can
+# review is config that drifts.
 #
 # To use it: Render dashboard -> New -> Blueprint -> pick this repository.
 # Render reads this file and creates the service. If the blueprint flow gives
@@ -15,7 +14,7 @@
 #   Branch:           main
 #   Instance type:    Free
 #   Health check:     /v1/health
-#   Environment:      PORT = 8787
+#   Environment:      PORT = 8787, NODE_ENV = production
 #
 # THE DATASET DOES NOT COME FROM HERE. The Dockerfile downloads events.sqlite
 # from the `dataset-latest` GitHub release at build time. Publish it before the
@@ -31,6 +30,13 @@
 # request pays a cold start of up to a minute while the container boots. Circa
 # pings /v1/health when the page loads so the machine wakes while the visitor is
 # still filling in the form.
+#
+# NOTE ON RATE LIMITING: it happens inside this process, not at the edge. The
+# free plan has no WAF or rate-limiting layer, and the client is a static bundle
+# on Cloudflare Pages -- Cloudflare fronts the site, not this API, and a limit
+# enforced in client code is not a limit. server.ts is the only place it can be
+# enforced, which is why TRUSTED_PROXY_HOPS below matters: without it the
+# limiter keys every request in the world to Render's proxy address.
 # =============================================================================
 
 services:
@@ -58,9 +64,46 @@ services:
       - key: PORT
         value: 8787
 
-      # Set in the Render dashboard once Cloudflare Pages has issued a URL.
-      # Until then the browser is refused every request even though the API is
-      # healthy, and the failure looks exactly like an outage. sync: false keeps
-      # the value out of the repo and stops a blueprint sync from clearing it.
+      # Set explicitly, and NOT because the Dockerfile already does it.
+      #
+      # The Dockerfile's ENV NODE_ENV=production is a default that any dashboard
+      # or blueprint variable silently overrides, and server.ts reads this one
+      # value to decide whether it is in production. When it was absent here,
+      # IS_PROD was determined entirely by whether something else happened to
+      # set it -- and a security decision should not rest on that. Declaring it
+      # in the blueprint makes it reviewable in the repo.
+      - key: NODE_ENV
+        value: production
+
+      # Number of proxies between the internet and this process. Render puts
+      # exactly one in front of a web service, so the client address is the
+      # last entry in X-Forwarded-For. Anything larger trusts a hop that does
+      # not exist and lets a caller spoof its own rate-limit key by prepending
+      # addresses to the header; see net.ts.
+      - key: TRUSTED_PROXY_HOPS
+        value: 1
+
+      # Carried over from fly.toml, which was the only place these were written
+      # down. Same values, now on the platform that is actually serving.
+      - key: RATE_LIMIT_MAX
+        value: 60
+      - key: RATE_LIMIT_WINDOW
+        value: 60
+
+      # The browser origin allowed to call this API -- currently Circa on
+      # Cloudflare Pages (https://circa-2cg.pages.dev), plus any custom domain
+      # once one is registered. Comma-separated for more than one.
+      #
+      # sync: false keeps the value out of the repo and stops a blueprint sync
+      # from clearing it. Until it is set the browser is refused every request
+      # even though the API is healthy, and the failure looks exactly like an
+      # outage.
+      #
+      # It also now gates two things it did not before: with an allowlist set,
+      # POSTs arriving with no Origin header at all are refused (set
+      # ALLOW_NO_ORIGIN_POST=true to permit curl and CI), and the localhost dev
+      # origins are no longer admitted just because this variable is missing --
+      # that needs an explicit ALLOW_DEV_ORIGINS=true and a non-production
+      # NODE_ENV, so it cannot happen here at all.
       - key: ALLOWED_ORIGIN
         sync: false

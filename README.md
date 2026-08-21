@@ -2,7 +2,7 @@
 
 *An open, geo-located historical events dataset and a deterministic timeline protocol. Give it a person's places and dates; get back a sourced timeline of the history that surrounded their life.*
 
-**Status:** v0.7 - comprehensive dataset (~106k events) + curated milestone seed layer (330 rows) + event-radius engine + JSON API + prune tooling
+**Status:** v0.7 - comprehensive dataset (~106k events) + curated milestone seed layer (330 rows) + event-radius engine + JSON API (live on Render) + prune tooling
 
 ## Overview
 
@@ -12,6 +12,8 @@ GeoHistory answers one question: *"What was happening in and around the places w
 2. **A deterministic timeline engine** - a pure function that takes a list of life events (place + date) and returns a ranked, cited timeline. No network calls or model inference at query time.
 
 All intelligence is computed **once, at build time**, and frozen into static columns. Query time is pure lookups, so the same file drives both a server API and an in-browser applet.
+
+The scope of this repository is deliberately narrow: **the dataset, its ingest and scoring pipeline, and the read-only API that exposes them.** Presentation lives in Circa, a separate client.
 
 ## The two axes of relevance
 
@@ -75,15 +77,19 @@ A thin, dependency-free HTTP server (Node's built-in `http`, no extra packages) 
 npm run serve            # http://localhost:8787  (override with PORT)
 ```
 
+Deployed as a Docker web service on **Render** (see `render.yaml`), which is the only live API point.
+
+**Every route is under `/v1`.** There is no root document and no unversioned alias; anything else returns `404`.
+
 | Method / path | Purpose |
 | --- | --- |
-| `GET /` | self-documenting: service info + an example request body |
-| `GET /health` | liveness check |
-| `GET /meta` | dataset provenance (version, window) + event count |
-| `GET /search?q=<term>&limit=<n>` | full-text search (default 25, max 100) |
-| `POST /timeline` | body = `TimelineInput` JSON -> `Timeline` JSON; add `?format=markdown` for Markdown |
+| `GET /v1/health` | liveness check; does not touch the database |
+| `GET /v1/meta` | dataset provenance + engine defaults, config bounds, and the request limits below |
+| `GET /v1/search?q=<term>&limit=<n>` | full-text search (default 25, max 100) |
+| `POST /v1/timeline` | body = `TimelineInput` JSON -> `Timeline` JSON; add `?format=markdown` for Markdown |
+| `POST /v1/feedback` | a coarsened thumbs up/down, forwarded to a Notion Worker; never stored here |
 
-`POST /timeline` takes a person's life segments and returns the ranked, cited timeline:
+`POST /v1/timeline` takes a person's life segments and returns the ranked, cited timeline:
 
 ```json
 {
@@ -94,7 +100,59 @@ npm run serve            # http://localhost:8787  (override with PORT)
 }
 ```
 
-The response is the exact `Timeline` object `getTimeline()` returns (`entries` + `meta` + `datasetVersion`). Invalid input (missing segments, non-numeric coordinates, unparseable dates) returns a `400` with a specific message. CORS is open so a browser applet can call it directly.
+The response is the exact `Timeline` object `getTimeline()` returns (`entries` + `meta` + `datasetVersion`).
+
+### Access control
+
+**CORS is not open.** Browser requests are refused unless their `Origin` is in the `ALLOWED_ORIGIN` allowlist, and once that allowlist is set, a `POST` arriving with no `Origin` header at all is refused too (set `ALLOW_NO_ORIGIN_POST=true` to permit `curl` and CI). Set `ALLOWED_ORIGIN` in the Render dashboard to the Circa origin before expecting the client to work -- until then the API is healthy and every browser call fails, which looks exactly like an outage.
+
+Local dev origins (`localhost:5173/4173`) require an explicit `ALLOW_DEV_ORIGINS=true` **and** a non-production `NODE_ENV`. They are not admitted merely because `ALLOWED_ORIGIN` is unset.
+
+### Request limits
+
+Rate limiting is enforced **inside this process**. The free Render plan has no WAF or edge rate limiter, and the client is a static bundle -- a limit in client code is not a limit. Requests are keyed on the client address derived from `X-Forwarded-For` per `TRUSTED_PROXY_HOPS` (see `net.ts`), IPv6 collapsed to a `/64` so a single allocation cannot rotate addresses to buy more budget.
+
+| Guard | Default | Env |
+| --- | --- | --- |
+| Requests per client per window | 60 / 60s | `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW` |
+| Votes per client per window | 10 / 60s | `FEEDBACK_RATE_LIMIT_MAX`, `FEEDBACK_RATE_LIMIT_WINDOW` |
+| Tracked rate-limit keys | 10000 | `MAX_RATE_LIMIT_KEYS` |
+| Proxy hops in front of the process | 1 (Render) | `TRUSTED_PROXY_HOPS` |
+| Concurrent timeline builds | 4, then `503` | `MAX_CONCURRENT_TIMELINES` |
+| Request body | 64 KB | `MAX_BODY_BYTES` |
+| Request timeout | 15s | `REQUEST_TIMEOUT_MS` |
+| Segments per request | 40 | - |
+| Years per segment | 300 | `MAX_SEGMENT_SPAN_YEARS` |
+| Years across all segments | 3000 | `MAX_TOTAL_SPAN_YEARS` |
+
+Invalid input (missing segments, non-numeric coordinates, unparseable dates, an out-of-range or over-long year span) returns a `400` with a specific message. Dates are parsed with the engine's own parser at validation time, so a request that passes validation cannot fail differently inside the engine.
+
+### The `config` object
+
+`POST /v1/timeline` accepts a partial `EngineConfig` to override query-time tuning. It is **allowlisted and clamped**, not merely shape-checked: an unknown key is a `400` naming the accepted keys, and every value must fall inside the bounds below. `GET /v1/meta` publishes both `defaults` and `configBounds` so a client can stay inside them without hardcoding either.
+
+| Key | Type | Range |
+| --- | --- | --- |
+| `significanceFloor` | number | 0.01 - 1 |
+| `scopeFloor.{local,regional,national,global}` | number | 0.01 - 1 |
+| `maxPerSegment` | integer | 1 - 50 |
+| `maxSegments` | integer | 1 - 40 |
+| `scopeQuota.{local,regional,national,global}` | integer | 0 - 25 |
+| `personQuota` | integer | 0 - 25 |
+| `categoryWeights.*` | number | 0 - 1 |
+| `foundingKindWeights.*` | number | 0 - 1 |
+
+The engine applies its own independent floor (`ABSOLUTE_MIN_FLOOR`) and a per-segment candidate-row ceiling (`MAX_CANDIDATE_ROWS`), so a caller reaching `getTimeline` directly -- bypassing the API -- still cannot ask it to scan the whole table.
+
+### Dataset integrity
+
+The image downloads `events.sqlite` from the `dataset-latest` GitHub release, a mutable tag. Pass the expected digest to pin it:
+
+```bash
+docker build --build-arg DATASET_SHA256=$(sha256sum events.sqlite | cut -d' ' -f1) -t geohistory-api .
+```
+
+Builds without it still work and print the digest of what shipped, with a warning.
 
 ## Repo layout
 
@@ -112,18 +170,27 @@ The response is the exact `Timeline` object `getTimeline()` returns (`entries` +
 | `search.ts` | CLI full-text search over the dataset (`events_fts`) |
 | `stats.ts` | Read-only dataset diagnostics (counts by category / precision / scope + provenance) |
 | `server.ts` | JSON API wrapping `getTimeline` + search over `events.sqlite` (`npm run serve`) |
+| `net.ts` | Client-address derivation behind a proxy + the shared, bounded rate limiter |
+| `validate-config.ts` | Allowlist + clamp for the request `config` object |
+| `feedback.ts` | Vote validation, signing, and forwarding for `POST /v1/feedback` (writes nothing locally) |
+| `render.yaml` | Render blueprint for the deployed service |
 
-`events.sqlite` is a build artifact (gitignored) and will be published via GitHub Releases.
+`events.sqlite` is a build artifact (gitignored) and is published via GitHub Releases.
 
 ## Relevance tuning
 
 Query-time knobs live in `DEFAULT_CONFIG` in `core.ts` (no rescoring needed):
 
 - `significanceFloor` (0.15) - drop events below this era-normalized importance.
-- `scopeQuota` (`local 4 / regional 3 / national 4 / global 5`) - per-segment cap **per tier**; the flood control that guarantees a blend of local color + world context.
-- `categoryWeights` (`birth 0.4 / death 0.5`) - rank multipliers; celebrity births are demoted vs. substantive history.
+- `scopeFloor` (`local 0.05 / regional 0.15 / national 0.15 / global 0.2`) - per-tier override of the floor above, because dump events, humans, and curated seed rows enter on three different notability scales.
+- `scopeQuota` (`local 4 / regional 3 / national 4 / global 5`) plus `personQuota` (2) - per-segment cap **per tier**; the flood control that guarantees a blend of local color + world context. Births and deaths draw from their own `person` tier rather than competing with local history.
+- `categoryWeights` (`birth 0.4 / death 0.5 / founding 0.7`) and `foundingKindWeights` (`settlement 0.35 / institution 0.5 / subnational 0.9 / country 0.9`) - rank multipliers; celebrity births and bare village incorporations are demoted vs. substantive history.
 
 Scope thresholds live in `score.ts` pass 1; the reach formula in pass 2. Retuning reach is a no-LLM patch: `npm run score reach`.
+
+## Tests
+
+There is no test runner here by design. This repository is the dataset, its pipeline, and a read-only API over it; correctness of the *data* is checked by `npm run stats` and by the prune tooling's dry runs, both of which report on a real build rather than a fixture. `npx tsc --noEmit` in CI is the automated gate on the code, and the API's own validation layer is written to fail closed. Behavioral tests live in the client (Circa), where the assertions are cheap and the fixtures are small.
 
 ## Known refinements (planned)
 

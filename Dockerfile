@@ -12,7 +12,7 @@
 # not in the repository and never will be. Rather than require it in the build
 # context -- which would mean only a machine holding the database could build --
 # the image DOWNLOADS it from the public GitHub release. Any host that builds
-# from the repo alone (Render, Fly, a CI runner) can therefore produce a working
+# from the repo alone (Render, a CI runner) can therefore produce a working
 # image with no manual upload.
 #
 # Publish the dataset once:
@@ -24,6 +24,9 @@
 #   docker build -t geohistory-api .
 #   docker run --rm -p 8787:8787 geohistory-api
 #   curl localhost:8787/v1/meta
+#
+# Build with the dataset digest pinned (recommended, see DATASET_SHA256):
+#   docker build --build-arg DATASET_SHA256=$(sha256sum events.sqlite | cut -d' ' -f1) -t geohistory-api .
 # =============================================================================
 
 
@@ -31,6 +34,13 @@
 # Stage 1: the dataset
 # ---------------------------------------------------------------------------
 FROM node:20-slim AS dataset
+
+# Several RUN steps below pipe into head, and a pipeline reports only the exit
+# status of its last command -- so a failing sqlite3 or a truncated read would
+# be masked by a successful `head` and the build would carry on. pipefail makes
+# the pipeline fail with the first failing stage instead. This also resolves the
+# hadolint DL4006 warning that has been failing the PR check on main.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl ca-certificates sqlite3 \
@@ -42,6 +52,26 @@ RUN apt-get update \
 # to whatever the new dump is stamped with, or pass --build-arg at build time.
 ARG DATASET_VERSION=dump-v0.5+struct-v0.6+reach-v0.2+prune3
 ARG DATASET_URL=https://github.com/noffsingercb/GeoHistory/releases/download/dataset-latest/events.sqlite
+
+# Expected SHA-256 of events.sqlite. Empty by default, which keeps every
+# existing build working, but SET IT when you can.
+#
+# The size and magic-header checks below catch an accident -- a 404 page, a
+# truncated download. They cannot catch a substitution, and this is the one
+# input to the image that is fetched over the network from a mutable location: a
+# release tag that is deliberately re-uploaded with --clobber. Whoever can write
+# to that tag can change what every future deploy serves, and the served rows
+# are the entire product. A digest is the only check that distinguishes "the
+# database I built" from "a database".
+#
+# It is a build arg rather than a hardcoded constant because the dataset is
+# refreshed far more often than this file changes, and a stale pinned digest
+# that has to be edited in lockstep would simply be deleted the first time it
+# blocked a deploy. Get the value with:
+#   sha256sum events.sqlite
+# and pass it on the Render dashboard (Settings -> Build -> Docker build args)
+# or with --build-arg locally.
+ARG DATASET_SHA256=
 
 WORKDIR /data
 
@@ -63,6 +93,23 @@ RUN echo "Fetching dataset ${DATASET_VERSION}" \
  && if [ "$header" != "SQLite format 3" ]; then \
       echo "ERROR: not a SQLite database (header: '${header}')."; \
       exit 1; \
+    fi \
+ && if [ -n "${DATASET_SHA256}" ]; then \
+      echo "${DATASET_SHA256}  events.sqlite" > events.sqlite.sha256; \
+      if sha256sum -c events.sqlite.sha256; then \
+        echo "Dataset digest verified."; \
+      else \
+        echo "ERROR: dataset digest mismatch."; \
+        echo "ERROR: expected ${DATASET_SHA256}"; \
+        echo "ERROR: actual   $(sha256sum events.sqlite | cut -d' ' -f1)"; \
+        echo "ERROR: the release asset is not the database this build expects."; \
+        exit 1; \
+      fi; \
+      rm -f events.sqlite.sha256; \
+    else \
+      echo "WARNING: DATASET_SHA256 is unset -- the downloaded database is UNVERIFIED."; \
+      echo "WARNING: digest of what shipped: $(sha256sum events.sqlite | cut -d' ' -f1)"; \
+      echo "WARNING: pass it as --build-arg DATASET_SHA256=... to pin future builds."; \
     fi
 
 # ---------------------------------------------------------------------------
@@ -92,6 +139,11 @@ RUN echo "Fetching dataset ${DATASET_VERSION}" \
 # multi-minute, disk-hungry step on the critical path of every deploy. Do it
 # once on the workstation and re-upload:
 #   sqlite3 events.sqlite "VACUUM;"
+#
+# NOTE ON THE DIGEST: pin DATASET_SHA256 to the digest of the file as UPLOADED.
+# The conversion below rewrites the database in place, so the file in the final
+# image will not match that digest -- the check above runs on what was fetched,
+# which is the thing being authenticated.
 RUN echo "Journal mode before: $(sqlite3 events.sqlite 'PRAGMA journal_mode;')" \
  && sqlite3 events.sqlite "PRAGMA journal_mode=DELETE;" \
  && mode=$(sqlite3 events.sqlite "PRAGMA journal_mode;") \
@@ -155,9 +207,13 @@ COPY --from=deps /app/node_modules ./node_modules
 # Application sources. Listed explicitly rather than `COPY . .` so that adding a
 # file to the repo cannot quietly enlarge the image or leak local artifacts --
 # .dockerignore is the second line of defence, not the first.
+#
+# The trade-off is that a NEW module imported by server.ts must be added here or
+# the image builds clean and then dies on its first import. net.ts and
+# validate-config.ts are that case.
 COPY package.json ./
 COPY tsconfig.json ./
-COPY server.ts core.ts feedback.ts ./
+COPY server.ts core.ts feedback.ts net.ts validate-config.ts ./
 
 # ---------------------------------------------------------------------------
 # The dataset
