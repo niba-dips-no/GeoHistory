@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { createRateLimiter, rateLimitKey } from './net';
 
 // ===================== Feedback capture (write-free) =====================
 // Backing module for POST /v1/feedback.
@@ -11,7 +12,7 @@ import crypto from 'node:crypto';
 // Environment:
 //   CIRCA_FEEDBACK_WEBHOOK_URL   Notion Worker webhook. Unset => accept + drop.
 //   CIRCA_FEEDBACK_SECRET        HMAC-SHA256 signing key. Unset => accept + drop.
-//   FEEDBACK_RATE_LIMIT_MAX      votes per IP per window (default 10)
+//   FEEDBACK_RATE_LIMIT_MAX      votes per client per window (default 10)
 //   FEEDBACK_RATE_LIMIT_WINDOW   window in seconds (default 60)
 //   FEEDBACK_FORWARD_TIMEOUT     ms to wait on the worker (default 5000)
 
@@ -67,6 +68,10 @@ export type Vote = {
 // visitor. It is public dataset data, already rendered on the tile the vote
 // came from, and it exists so the Notion rows are readable as something other
 // than a column of opaque ids.
+//
+// The same allowlist-and-refuse shape is now used for the `config` object on
+// POST /v1/timeline -- see validate-config.ts, which was written against this
+// module as the reference.
 const ALLOWED_KEYS = new Set<string>([
   'voteId', 'eventId', 'eventTitle', 'verdict', 'scope', 'significance', 'reachKm',
   'headroom', 'relaxed', 'distanceBucket', 'segmentDecade',
@@ -153,27 +158,37 @@ export function validateVote(body: unknown): Vote {
 // Separate from the general limiter on purpose. Votes are cheap to issue and
 // cheap to spam, and vote spam must not be able to exhaust somebody's timeline
 // budget for the window.
+//
+// The bucket map, the keying and the sweep now come from net.ts, which both
+// limiters share. Previously this module kept its own Map and its own key
+// handling -- so it inherited the same two defects as the general limiter
+// (keyed on the proxy's socket address, unbounded growth) and would have had to
+// be fixed twice. One implementation cannot drift from itself.
 
-const voteBuckets = new Map<string, { count: number; resetAt: number }>();
+const voteLimiter = createRateLimiter({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: RATE_LIMIT_MAX,
+});
 
-export function feedbackRateLimit(key: string): { ok: boolean; retryAfter: number } {
-  const now = Date.now();
-  let b = voteBuckets.get(key);
-  if (!b || b.resetAt <= now) {
-    b = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
-    voteBuckets.set(key, b);
-  }
-  b.count++;
-  return {
-    ok: b.count <= RATE_LIMIT_MAX,
-    retryAfter: Math.max(1, Math.ceil((b.resetAt - now) / 1000)),
-  };
+/**
+ * @param ip the DERIVED client address from net.ts getClientIp(), not
+ *           req.socket.remoteAddress. Keying on the socket peer behind Render's
+ *           edge puts every visitor in one bucket.
+ */
+export function feedbackRateLimit(ip: string): { ok: boolean; retryAfter: number } {
+  const { ok, retryAfter } = voteLimiter.hit(rateLimitKey(ip));
+  return { ok, retryAfter };
 }
 
-export const feedbackSweeper = setInterval(() => {
-  const now = Date.now();
-  for (const [k, b] of voteBuckets) if (b.resetAt <= now) voteBuckets.delete(k);
-}, RATE_LIMIT_WINDOW_MS).unref();
+/** Tracked bucket count, surfaced for the shutdown path and diagnostics. */
+export function feedbackBucketCount(): number {
+  return voteLimiter.size();
+}
+
+/** Stops the sweep interval. Called from the server's shutdown handler. */
+export function stopFeedbackLimiter(): void {
+  voteLimiter.stop();
+}
 
 // ===================== Counters (no bodies, ever) =====================
 
