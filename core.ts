@@ -86,7 +86,44 @@ export interface Timeline {
  * Bump whenever output changes for identical input -- including tuning defaults,
  * not just code structure.
  */
-export const ENGINE_VERSION = 'geohistory-core@0.5.1';
+export const ENGINE_VERSION = 'geohistory-core@0.5.2';
+
+/**
+ * The lowest significance the SQL prefilter will ever use, regardless of what a
+ * caller asked for.
+ *
+ * server.ts already allowlists and clamps the incoming config (see
+ * validate-config.ts), so a request cannot reach here with a negative floor.
+ * This is the second, independent guard: the engine is a public function that
+ * timeline.ts and any future caller can invoke directly, and a floor is the one
+ * knob where an out-of-range value does not produce a wrong answer -- it
+ * produces a full table scan of ~107k rows per segment. Belt and braces is
+ * cheap here and the failure mode is not.
+ *
+ * 0.01 sits well below every default in DEFAULT_CONFIG (the lowest is local at
+ * 0.05) and below Circa's relaxed retry floor, so no legitimate request is
+ * touched by it.
+ */
+export const ABSOLUTE_MIN_FLOOR = 0.01;
+
+/**
+ * Hard ceiling on rows materialized from SQLite per segment.
+ *
+ * The prefilter is bounded by the reach bbox and the year window, which for a
+ * real life segment returns hundreds of rows. It is not bounded by anything a
+ * caller cannot influence: a low floor over a dense place and a wide year span
+ * is a large result set, and every row of it becomes a JS object, gets a
+ * haversine computed, and gets sorted -- before any quota applies.
+ *
+ * Taken in significance order rather than arbitrarily, for two reasons. The cut
+ * is deterministic, so the same request keeps returning the same timeline; and
+ * significance is the axis selection actually cares about, so the rows dropped
+ * at the boundary are the ones least able to win a slot. A caller under the cap
+ * -- which is all normal traffic, by a wide margin -- sees byte-identical
+ * output, since the per-segment matches are re-sorted by score immediately
+ * afterwards.
+ */
+export const MAX_CANDIDATE_ROWS = 5000;
 
 /** Categories drawn from the 'person' tier rather than their nominal scope. */
 const PERSON_CATEGORIES = new Set(['birth', 'death']);
@@ -300,9 +337,18 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
   // The SQL prefilter can only apply one number, so it applies the loosest floor in
   // play and keeps using idx_events_significance; the exact per-tier floor is
   // enforced per row below.
-  const minFloor = Math.min(
-    cfg.significanceFloor,
-    ...SCOPES.map((sc) => cfg.scopeFloor[sc]).filter((v): v is number => typeof v === 'number'),
+  //
+  // ABSOLUTE_MIN_FLOOR is applied here rather than to the incoming config, so it
+  // holds no matter which knob a caller used to get low: significanceFloor,
+  // any scopeFloor entry, or a combination. This is the number that decides how
+  // much of the table the query touches, so it is the right place to be
+  // unconditional.
+  const minFloor = Math.max(
+    ABSOLUTE_MIN_FLOOR,
+    Math.min(
+      cfg.significanceFloor,
+      ...SCOPES.map((sc) => cfg.scopeFloor[sc]).filter((v): v is number => typeof v === 'number'),
+    ),
   );
 
   const segments = input.segments.slice(0, cfg.maxSegments);
@@ -319,6 +365,10 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
 
   // An event matches when the observer's coordinate falls inside the event's own
   // reach box (cheap, portable spatial prefilter) -- exact haversine refines below.
+  //
+  // ORDER BY + LIMIT bound how much this can return. Without them the row count
+  // is a function of how low the floor is and how dense the place is, and every
+  // returned row costs an object, a haversine and a slot in a sort.
   const stmt = db.prepare(`
     SELECT id, title, ${hasDisplayTitle ? 'display_title' : 'NULL AS display_title'},
            blurb, date_start, date_end, date_precision, lat, lng,
@@ -330,6 +380,8 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
       AND reach_min_lat <= @lat AND reach_max_lat >= @lat
       AND reach_min_lng <= @lng AND reach_max_lng >= @lng
       AND substr(date_start, 1, 4) BETWEEN @loYear AND @hiYear
+    ORDER BY significance DESC, id ASC
+    LIMIT @limit
   `);
 
   let datasetVersion: string | null = null;
@@ -352,6 +404,7 @@ export function getTimeline(db: Database.Database, input: TimelineInput): Timeli
       lng: seg.place.lng,
       loYear: segLo.slice(0, 4),
       hiYear: segHi.slice(0, 4),
+      limit: MAX_CANDIDATE_ROWS,
     }) as EventRow[];
 
     const matches: TimelineEntry[] = [];
