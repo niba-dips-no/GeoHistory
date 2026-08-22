@@ -106,18 +106,22 @@ The response is the exact `Timeline` object `getTimeline()` returns (`entries` +
 
 **CORS is not open.** Browser requests are refused unless their `Origin` is in the `ALLOWED_ORIGIN` allowlist, and once that allowlist is set, a `POST` arriving with no `Origin` header at all is refused too (set `ALLOW_NO_ORIGIN_POST=true` to permit `curl` and CI). Set `ALLOWED_ORIGIN` in the Render dashboard to the Circa origin before expecting the client to work -- until then the API is healthy and every browser call fails, which looks exactly like an outage.
 
+The live client is `https://circatimeline.org` (with `https://www.circatimeline.org` and the older `https://circa-2cg.pages.dev` also allowed). Matching is exact, so Cloudflare Pages **preview** deployments -- which get a generated hostname per build -- are refused by design. A preview that loads but fails at the timeline step is behaving correctly; do not widen the allowlist to a wildcard to make it work.
+
 Local dev origins (`localhost:5173/4173`) require an explicit `ALLOW_DEV_ORIGINS=true` **and** a non-production `NODE_ENV`. They are not admitted merely because `ALLOWED_ORIGIN` is unset.
 
 ### Request limits
 
 Rate limiting is enforced **inside this process**. The free Render plan has no WAF or edge rate limiter, and the client is a static bundle -- a limit in client code is not a limit. Requests are keyed on the client address derived from `X-Forwarded-For` per `TRUSTED_PROXY_HOPS` (see `net.ts`), IPv6 collapsed to a `/64` so a single allocation cannot rotate addresses to buy more budget.
 
+`TRUSTED_PROXY_HOPS` is counted from the **right** of the header, because a caller can prepend anything they like to the left. Its value is **measured, not assumed**: Render fronts its services with Cloudflare, so three layers append to `X-Forwarded-For`, not one. With the wrong count the limiter keys on infrastructure addresses drawn from a rotating pool and silently stops limiting anything -- a 65-request burst returned 65 x `200` with no `429` at all under both `1` and `2`. At `3` the same burst returns 60 x `200` + 5 x `429`, which is the acceptance test; re-run it if the platform ever changes what sits in front of the service, because the failure is invisible otherwise. `render.yaml` records the measurement.
+
 | Guard | Default | Env |
 | --- | --- | --- |
 | Requests per client per window | 60 / 60s | `RATE_LIMIT_MAX`, `RATE_LIMIT_WINDOW` |
 | Votes per client per window | 10 / 60s | `FEEDBACK_RATE_LIMIT_MAX`, `FEEDBACK_RATE_LIMIT_WINDOW` |
 | Tracked rate-limit keys | 10000 | `MAX_RATE_LIMIT_KEYS` |
-| Proxy hops in front of the process | 1 (Render) | `TRUSTED_PROXY_HOPS` |
+| Proxy hops in front of the process | 3 (Cloudflare edge -> Render LB -> node; measured) | `TRUSTED_PROXY_HOPS` |
 | Concurrent timeline builds | 4, then `503` | `MAX_CONCURRENT_TIMELINES` |
 | Request body | 64 KB | `MAX_BODY_BYTES` |
 | Request timeout | 15s | `REQUEST_TIMEOUT_MS` |
@@ -191,6 +195,8 @@ Scope thresholds live in `score.ts` pass 1; the reach formula in pass 2. Retunin
 ## Tests
 
 There is no test runner here by design. This repository is the dataset, its pipeline, and a read-only API over it; correctness of the *data* is checked by `npm run stats` and by the prune tooling's dry runs, both of which report on a real build rather than a fixture. `npx tsc --noEmit` in CI is the automated gate on the code, and the API's own validation layer is written to fail closed. Behavioral tests live in the client (Circa), where the assertions are cheap and the fixtures are small.
+
+The corollary is that nothing here exercises the running service, which is exactly how the rate limiter shipped inert: a typecheck cannot notice that a limit never fires. Deployment-shaped guarantees have to be measured against the live instance -- see the burst under Request limits.
 
 ## Known refinements (planned)
 
