@@ -32,11 +32,15 @@
 # still filling in the form.
 #
 # NOTE ON RATE LIMITING: it happens inside this process, not at the edge. The
-# free plan has no WAF or rate-limiting layer, and the client is a static bundle
-# on Cloudflare Pages -- Cloudflare fronts the site, not this API, and a limit
-# enforced in client code is not a limit. server.ts is the only place it can be
-# enforced, which is why TRUSTED_PROXY_HOPS below matters: without it the
-# limiter keys every request in the world to Render's proxy address.
+# free plan gives us no WAF and no rate-limiting layer of our own. Render does
+# route through Cloudflare (see TRUSTED_PROXY_HOPS below), but that is Render's
+# account and not ours: it comes with no rules, no dashboard and no per-client
+# limits -- only an extra X-Forwarded-For hop to account for. The client is a
+# static bundle on Cloudflare Pages, and a limit enforced in client code is not
+# a limit. server.ts is the only place it can be enforced, which is why
+# TRUSTED_PROXY_HOPS matters: with the wrong value the limiter keys every
+# request in the world to a rotating infrastructure address and quietly stops
+# limiting anything at all.
 # =============================================================================
 
 services:
@@ -75,13 +79,38 @@ services:
       - key: NODE_ENV
         value: production
 
-      # Number of proxies between the internet and this process. Render puts
-      # exactly one in front of a web service, so the client address is the
-      # last entry in X-Forwarded-For. Anything larger trusts a hop that does
-      # not exist and lets a caller spoof its own rate-limit key by prepending
-      # addresses to the header; see net.ts.
+      # Number of hops between the internet and this process, counted from the
+      # RIGHT of X-Forwarded-For. MEASURED, not assumed.
+      #
+      # This file used to say "Render puts exactly one in front of a web
+      # service, so the client address is the last entry in X-Forwarded-For."
+      # That is false, and it silently disabled per-client rate limiting for as
+      # long as it stood. Render fronts its services with Cloudflare, so three
+      # layers append to the header before it arrives here.
+      #
+      # Observed 2026-08-22 by firing 65 requests in 3.5s from a known client
+      # address and reading the ip= field that server.ts logs on every request:
+      #
+      #   hops=1 -> 10.24.83.x, 10.25.191.x     Render's internal load balancer
+      #   hops=2 -> 172.68.3.x, 172.71.146.x    Cloudflare edge (172.64.0.0/13)
+      #   hops=3 -> the real client address
+      #
+      # At 1 and 2 the key was an infrastructure address drawn from a rotating
+      # pool, so a single client's burst scattered across several buckets and
+      # none of them reached the limit of 60 -- the burst returned 65x200 with
+      # no 429 at all. At 3 the same burst returns 60x200 + 5x429. That burst
+      # is the acceptance test for this value; re-run it after any change here.
+      #
+      # Counting from the right is what keeps this safe. A caller who sends
+      # their own X-Forwarded-For only grows the chain on the left, so a
+      # right-anchored index still lands on the address Cloudflare observed and
+      # cannot be moved by prepending junk. Setting this HIGHER than the number
+      # of layers that genuinely append is the dangerous direction: it indexes
+      # into attacker-supplied values and lets a caller choose its own bucket.
+      # Too low merely lumps every visitor into one bucket. Neither failure is
+      # visible without measuring, so measure -- see net.ts for the indexing.
       - key: TRUSTED_PROXY_HOPS
-        value: 1
+        value: 3
 
       # Carried over from fly.toml, which was the only place these were written
       # down. Same values, now on the platform that is actually serving.
@@ -90,9 +119,12 @@ services:
       - key: RATE_LIMIT_WINDOW
         value: 60
 
-      # The browser origin allowed to call this API -- currently Circa on
-      # Cloudflare Pages (https://circa-2cg.pages.dev), plus any custom domain
-      # once one is registered. Comma-separated for more than one.
+      # The browser origins allowed to call this API: the Circa custom domain
+      # https://circatimeline.org (with and without www), plus the Cloudflare
+      # Pages default https://circa-2cg.pages.dev that preceded it.
+      # Comma-separated for more than one. Exact match -- Pages PREVIEW
+      # deployments get generated hostnames and are therefore refused, which is
+      # deliberate but worth remembering when a preview build looks broken.
       #
       # sync: false keeps the value out of the repo and stops a blueprint sync
       # from clearing it. Until it is set the browser is refused every request
